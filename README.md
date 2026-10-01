@@ -43,3 +43,18 @@ Before running the pipeline, ensure your project directory looks exactly like th
 ├── step1_encode.py
 ├── step2_svm_train.py
 └── step3_explain.py
+
+## 💻 Local Setup & Installation
+
+Run the following commands in your terminal to clone the repository, install the dependencies, and run the project:
+
+```bash
+# Clone the repository
+git clone [https://github.com/hafeez-anwar/solar-XAI.git](https://github.com/hafeez-anwar/solar-XAI.git)
+cd solar-XAI
+
+# Install required Python packages
+pip install torch torchvision scikit-learn pandas pyyaml shap lime opencv-python tqdm openpyxl
+
+# Run the project
+python main.py --config config-encode.yaml
