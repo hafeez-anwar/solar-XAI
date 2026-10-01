@@ -1,5 +1,4 @@
 # solar-XAI
-
 # Model Tournament & Comprehensive Evaluation Pipeline
 
 An automated machine learning pipeline for evaluating, comparing, and explaining model candidates. The system runs a "tournament" across multiple configurations, scores them against comprehensive evaluation metrics (CV Accuracy, AUC, F1, Inference Speed, t-SNE), generates an aggregated leaderboard, and automatically applies Explainable AI (XAI) techniques to the winning model.
@@ -17,12 +16,12 @@ This pipeline requires two sets of data to run successfully: the main training/e
 
 ### 1. Main Dataset (`Dataset/`)
 Due to its size (GBs), the main dataset is hosted externally and is not included in this repository. 
-1. Download the dataset from: `[https://drive.google.com/file/d/1b8rcGBcd71clYMl15y_c5Txwlsvpzyv8/view?usp=sharing]`
+1. Download the dataset from: [Google Drive Link](https://drive.google.com/file/d/1b8rcGBcd71clYMl15y_c5Txwlsvpzyv8/view?usp=sharing)
 2. Extract it into a folder named `Dataset` at the root level. It must contain the `Clean` and `Dirty` subfolders.
 
 ### 2. XAI Ground Truth Dataset (`images_GT/`)
 This dataset is used in Phase 3 to evaluate the faithfulness of the XAI methods on the winning model. 
-1. Download the dataset from : ['https://drive.google.com/drive/folders/1WbJbX74HOI-3PrJrD-nBc5_oa0Z1Aqvq?usp=drive_link']
+1. Download the dataset from: [Google Drive Link](https://drive.google.com/drive/folders/1WbJbX74HOI-3PrJrD-nBc5_oa0Z1Aqvq?usp=drive_link)
 2. Place the `images_GT/` folder at the root level of this project.
 3. It must contain exactly two subfolders:
    - `images/`: Contains the 20 raw sample images.
