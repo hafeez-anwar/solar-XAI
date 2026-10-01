@@ -1,0 +1,89 @@
+# ===== Project paths =====
+output:
+  dir: "C:/Users/Dr Hafeez/Desktop/xAI/New-code-Feb-26"
+
+# ===== Model Selection (Tournament) =====
+models:
+  candidates:
+    - "vit_base_patch16_224"
+    - "vit_tiny_patch16_384"
+    - "vit_small_patch16_224"
+    - "vit_small_patch32_224"
+    - "vit_small_r26_s32_224"
+    - "tiny_vit_11m_224.dist_in22k"
+    - "tiny_vit_11m_224"
+    - "tiny_vit_21m_224.dist_in22k"
+    - "tiny_vit_21m_224"
+    - "tiny_vit_21m_384"
+    - "tiny_vit_5m_224.dist_in22k"
+    - "tiny_vit_5m_224"
+    - "swin_small_patch4_window7_224"
+    - "swin_tiny_patch4_window7_224"
+    - "convit_tiny"
+   
+
+  # Metric to decide the winner (Fixed indentation)
+  selection_metric: "accuracy" 
+
+  # Common settings
+  pooling: "cls"
+  img_size: null
+
+# ===== Dataset =====
+data:
+  root: "C:/Users/Dr Hafeez/Desktop/xAI/Dataset"
+  extensions: [".jpg", ".jpeg", ".png", ".bmp"]
+
+# ===== SVM training (Step 2) =====
+train:
+  test_size: 0.2
+  random_state: 42
+  standardize: true
+  class_weight: "balanced"
+  C: 1.0
+  max_iter: 2000
+  
+  # New: Evaluation Settings
+  tsne_samples: 1000  # Max samples to plot (prevent crash on large data)
+
+# ===== Explainability (Winner Only) =====
+explain:
+  images_dir: "C:/Users/Dr Hafeez/Desktop/xAI/images_GT/images"
+  masks_dir:  "C:/Users/Dr Hafeez/Desktop/xAI/images_GT/masks"
+  mask_suffix: "_mask"
+  thresholds: [0.3, 0.5, 0.7]
+  save_vis: true
+  overlay_alpha: 0.6
+  resume: true
+
+  # New: Faithfulness Metric
+  faithfulness:
+    enabled: true
+    mask_top_percent: 0.20  # Hide top 20% important pixels to test logic
+
+  methods:
+    rollout: true
+    lime: true
+    rise: true
+    shap: true
+
+  lime:
+    num_samples: 500
+    num_features: 10
+    hide_color: 0
+    segments: 100
+
+  rise:
+    N: 1000
+    p: 0.5
+    sizes: [8, 12, 16]
+    jitter: 16
+    smooth_sigma: 1.0
+  
+  rise_vis:
+    mode: "topk"
+    topk_percent: 10
+    color: [0, 255, 0]
+
+  shap:
+    nsamples: 300
