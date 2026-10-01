@@ -44,7 +44,7 @@ Before running the pipeline, ensure your project directory looks exactly like th
 ├── step2_svm_train.py
 └── step3_explain.py
 
-## 💻 Local Setup & Installation
+### Local Setup & Installation
 
 Run the following commands in your terminal to clone the repository, install the dependencies, and run the project:
 
