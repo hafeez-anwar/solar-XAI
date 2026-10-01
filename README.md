@@ -43,10 +43,3 @@ Before running the pipeline, ensure your project directory looks exactly like th
 ├── step1_encode.py
 ├── step2_svm_train.py
 └── step3_explain.py
-
-### 🚀 How to Run the Project
-
-Once your datasets are in place and dependencies are installed, you can run the entire pipeline from your terminal with this single command:
-
-```bash
-python main.py --config config-encode.yaml
