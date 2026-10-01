@@ -17,7 +17,7 @@ This pipeline requires two sets of data to run successfully: the main training/e
 
 ### 1. Main Dataset (`Dataset/`)
 Due to its size (GBs), the main dataset is hosted externally and is not included in this repository. 
-1. Download the dataset from: `[Insert Download Link Here - e.g., Google Drive, Kaggle, Hugging Face]`
+1. Download the dataset from: `[https://drive.google.com/file/d/1b8rcGBcd71clYMl15y_c5Txwlsvpzyv8/view?usp=sharing]`
 2. Extract it into a folder named `Dataset` at the root level. It must contain the `Clean` and `Dirty` subfolders.
 
 ### 2. XAI Ground Truth Dataset (`images_GT/`)
