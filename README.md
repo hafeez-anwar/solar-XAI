@@ -22,8 +22,9 @@ Due to its size (GBs), the main dataset is hosted externally and is not included
 
 ### 2. XAI Ground Truth Dataset (`images_GT/`)
 This dataset is used in Phase 3 to evaluate the faithfulness of the XAI methods on the winning model. 
-1. Place the `images_GT/` folder at the root level of this project.
-2. It must contain exactly two subfolders:
+1. Download the dataset from : ['https://drive.google.com/drive/folders/1WbJbX74HOI-3PrJrD-nBc5_oa0Z1Aqvq?usp=drive_link']
+2. Place the `images_GT/` folder at the root level of this project.
+3. It must contain exactly two subfolders:
    - `images/`: Contains the 20 raw sample images.
    - `masks/`: Contains the 20 corresponding binary masks for those images.
 
