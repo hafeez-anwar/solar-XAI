@@ -181,27 +181,7 @@ are convolutions.
 * `explanations/<model>/<method>/metrics_<method>.csv` gives per image IoU and Dice at thresholds
   0.3, 0.5 and 0.7, the faithfulness drop, and the runtime in seconds.
 
-## Known behaviour
 
-* `torch.quantization.quantize_dynamic` converts the weights of `nn.Linear` modules only.
-  Architectures whose projections are implemented as pointwise convolutions are therefore
-  left untouched, and the INT8 pass reproduces the FP32 encodings byte for byte. In our
-  runs this applies to `mobilevitv2_100` and `efficientformerv2_s1`, whose metrics are
-  identical in both passes. Check this by comparing `features.npy` between the two output
-  directories before attributing any difference, or any absence of one, to quantization.
-* Some architectures cannot be quantized at all, which is why `convit_tiny` is not among the
-  fifteen candidates. It raises during the forward
-  pass after `quantize_dynamic`, because its gated positional self attention accesses the
-  `nn.Linear` modules that the procedure replaces. The run then stops at the feature
-  dimension probe, leaving an `efficiency.json` with `inference_ms: 0.0`, a header-only
-  `progress.csv` and no encodings. Use `check_candidates.py` to detect this in advance.
-* Attention rollout writes an empty metrics file for architectures it cannot traverse. The
-  file is created but contains no rows, and the incremental runner tolerates that rather
-  than repeating the stage.
-* Latency measured while other work runs on the same host varies considerably. Timings
-  intended for publication should be taken on an otherwise idle machine.
-* Encodings are precision specific. Keep a separate `output.dir` per pass, since the
-  incremental check treats a model as processed once its encodings and metrics exist.
 
 ## Citation
 
