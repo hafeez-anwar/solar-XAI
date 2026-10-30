@@ -36,8 +36,7 @@ Two sets of images are needed. Neither is stored in this repository.
 ### 1. Main dataset (`Dataset/`)
 
 The images originate from the publicly available *Solar Panel Dust Detection* collection on Kaggle
-(https://www.kaggle.com/datasets/pythonafroz/solar-panel-dust-detection), which contains 1,068
-images. Because that collection was assembled from online sources, the same scene sometimes appears
+(https://www.kaggle.com/datasets/pythonafroz/solar-panel-dust-detection). Because that collection was assembled from online sources, the same scene sometimes appears
 twice, once as a thumbnail and once at full size, and resizing every input to a fixed resolution
 makes such a pair effectively identical. The copy used in the paper has been inspected manually and
 the redundant images removed, which leaves **1,056 images, 405 Clean and 651 Dirty**.
