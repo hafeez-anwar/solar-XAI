@@ -21,12 +21,6 @@ Transformer Framework for Image-based Photovoltaic Soiling Detection*.
 Python 3.8 or newer with `torch`, `torchvision`, `timm`, `scikit-learn`, `numpy`, `pandas`,
 `matplotlib`, `seaborn`, `pyyaml`, `openpyxl`, `lime` and `shap`.
 
-Pin the `timm` version you use and record it, because the layout of `forward_features` output is not
-uniform across architectures. TinyViT and the hybrids emit NCHW while Swin emits NHWC. The pooling in
-`vit_forward_embeddings` relies on `timm`'s own classifier head, created with `num_classes=0`, which
-pools correctly for every family. Reverting to a hand written mean over the last two axes silently
-reduces Swin features to a vector of length H and collapses its accuracy to the majority class rate.
-
 A CUDA GPU speeds up encoding but is not required. All results in the paper were produced on CPU.
 
 ## Datasets
@@ -36,11 +30,11 @@ Two sets of images are needed. Neither is stored in this repository.
 ### 1. Main dataset (`Dataset/`)
 
 The images originate from the publicly available *Solar Panel Dust Detection* collection on Kaggle
-(https://www.kaggle.com/datasets/pythonafroz/solar-panel-dust-detection), which contains 1,068
-images. Because that collection was assembled from online sources, the same scene sometimes appears
-twice, once as a thumbnail and once at full size, and resizing every input to a fixed resolution
-makes such a pair effectively identical. The copy used in the paper has been inspected manually and
-the redundant images removed, which leaves **1,056 images, 405 Clean and 651 Dirty**.
+(https://www.kaggle.com/datasets/pythonafroz/solar-panel-dust-detection). Because that collection 
+was assembled from online sources, the same scene sometimes appears twice, once as a thumbnail and 
+once at full size, and resizing every input to a fixed resolution makes such a pair effectively identical. 
+The copy used in the paper has been inspected manually and the redundant images removed, 
+which leaves **1,056 images, 405 Clean and 651 Dirty**.
 
 Download the cleaned copy used in the paper:
 https://drive.google.com/file/d/1b8rcGBcd71clYMl15y_c5Txwlsvpzyv8/view?usp=sharing
@@ -148,8 +142,7 @@ python check_candidates.py --config config.yaml
 `step2_svm_train.py` creates the stratified holdout partition first, then runs five fold stratified
 cross validation **on the training partition only**, and finally trains on the training partition and
 evaluates once on the holdout partition. Candidate ranking therefore uses cross validation accuracy
-and the holdout accuracy is reported for the selected model. An earlier version of this script ran
-the folds over the complete encoded set, which made the two estimates overlap.
+and the holdout accuracy is reported for the selected model. 
 
 Probabilities come from `CalibratedClassifierCV` wrapped around `LinearSVC`, so the confidence values
 in `error_analysis/error_report.csv` and in the confidence histogram are Platt scaled.
@@ -166,27 +159,6 @@ in `error_analysis/error_report.csv` and in the confidence histogram are Platt s
   discordant counts for a paired McNemar test.
 * `explanations/<model>/<method>/metrics_<method>.csv` gives per image IoU and Dice at thresholds
   0.3, 0.5 and 0.7, the faithfulness drop, and the runtime in seconds.
-
-## Known behaviour
-
-* `torch.quantization.quantize_dynamic` converts the weights of `nn.Linear` modules only.
-  Architectures whose projections are implemented as pointwise convolutions are therefore
-  left untouched, and the INT8 pass reproduces the FP32 encodings byte for byte. In our
-  runs this applies to `mobilevitv2_100` and `efficientformerv2_s1`, whose metrics are
-  identical in both passes. Check this by comparing `features.npy` between the two output
-  directories before attributing any difference, or any absence of one, to quantization.
-* Some architectures cannot be quantized at all. `convit_tiny` raises during the forward
-  pass after `quantize_dynamic`, because its gated positional self attention accesses the
-  `nn.Linear` modules that the procedure replaces. The run then stops at the feature
-  dimension probe, leaving an `efficiency.json` with `inference_ms: 0.0`, a header-only
-  `progress.csv` and no encodings. Use `check_candidates.py` to detect this in advance.
-* Attention rollout writes an empty metrics file for architectures it cannot traverse. The
-  file is created but contains no rows, and the incremental runner tolerates that rather
-  than repeating the stage.
-* Latency measured while other work runs on the same host varies considerably. Timings
-  intended for publication should be taken on an otherwise idle machine.
-* Encodings are precision specific. Keep a separate `output.dir` per pass, since the
-  incremental check treats a model as processed once its encodings and metrics exist.
 
 ## Citation
 
