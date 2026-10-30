@@ -1,6 +1,6 @@
 # ===== Project paths =====
 output:
-  dir: "C:/Users/Dr Hafeez/Desktop/xAI/New-code-Feb-26"
+  dir: "./outputs_int8"
 
 # ===== Model Selection (Tournament) =====
 models:
@@ -21,17 +21,26 @@ models:
     - "swin_tiny_patch4_window7_224"
     - "convit_tiny"
    
-
-  # Metric to decide the winner (Fixed indentation)
+  # Metric to decide the winner
   selection_metric: "accuracy" 
 
   # Common settings
   pooling: "cls"
   img_size: null
 
+# ===== Runtime =====
+runtime:
+  device: "cpu"
+  batch_size: 64
+  num_workers: 4
+  # Set to false for the FP32 pass and true for the INT8 pass. Point
+  # output.dir at a different folder for each pass so the two sets of
+  # encodings and metrics do not overwrite each other.
+  quantize: true
+
 # ===== Dataset =====
 data:
-  root: "C:/Users/Dr Hafeez/Desktop/xAI/Dataset"
+  root: "./Dataset"
   extensions: [".jpg", ".jpeg", ".png", ".bmp"]
 
 # ===== SVM training (Step 2) =====
@@ -43,20 +52,20 @@ train:
   C: 1.0
   max_iter: 2000
   
-  # New: Evaluation Settings
+  # Evaluation Settings
   tsne_samples: 1000  # Max samples to plot (prevent crash on large data)
 
 # ===== Explainability (Winner Only) =====
 explain:
-  images_dir: "C:/Users/Dr Hafeez/Desktop/xAI/images_GT/images"
-  masks_dir:  "C:/Users/Dr Hafeez/Desktop/xAI/images_GT/masks"
+  images_dir: "./images_GT/images"
+  masks_dir:  "./images_GT/masks"
   mask_suffix: "_mask"
   thresholds: [0.3, 0.5, 0.7]
   save_vis: true
   overlay_alpha: 0.6
   resume: true
 
-  # New: Faithfulness Metric
+  # Faithfulness Metric
   faithfulness:
     enabled: true
     mask_top_percent: 0.20  # Hide top 20% important pixels to test logic
@@ -87,3 +96,10 @@ explain:
 
   shap:
     nsamples: 300
+
+# ===== Advanced =====
+advanced:
+  strict_local_load: false
+  # Leave false. When true, a checkpoint is accepted on partial name
+  # overlap, which can load a sibling variant such as dist_in22k.
+  allow_fuzzy_checkpoint: false
