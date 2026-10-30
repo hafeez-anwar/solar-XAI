@@ -164,36 +164,47 @@ def main():
     X = open_memmap(enc_path, mode="r")
     y = open_memmap(lab_path, mode="r")
 
-    # --- 2. Cross-Validation ---
-    print("\n>>> Running 5-Fold Cross-Validation...")
+    # --- 2. Holdout partition ---
+    # The partition is created before cross-validation so that the folds are
+    # drawn from the training portion only. Running the folds over the whole
+    # encoded set, as an earlier version of this script did, lets each fold
+    # train on images that are also in the reported test set, which makes the
+    # cross-validation accuracy and the holdout accuracy dependent on one
+    # another and inflates both.
+    print("\n>>> Creating stratified holdout partition...")
+    sss = StratifiedShuffleSplit(n_splits=1, test_size=cfg["train"].get("test_size", 0.2), random_state=cfg["train"].get("random_state", 42))
+    train_idx, test_idx = next(sss.split(X, y))
+
+    X_train, X_test = X[train_idx], X[test_idx]
+    y_train, y_test = y[train_idx], y[test_idx]
+    print(f"   Train: {len(y_train)}  Test: {len(y_test)}")
+
+    # --- 3. Cross-Validation on the training portion ---
+    print("\n>>> Running 5-Fold Cross-Validation on the training split...")
     cv_clf = LinearSVC(
         class_weight=cfg["train"].get("class_weight", None),
         C=cfg["train"].get("C", 1.0),
-        max_iter=10000, 
+        max_iter=10000,
         dual="auto"
     )
-    
-    # Subsample for CV if dataset is huge
-    if len(y) > 50000:
-        idx_cv = np.random.choice(len(y), 10000, replace=False)
-        X_cv, y_cv = X[idx_cv], y[idx_cv]
+
+    # Subsample for CV if the training split is very large
+    if len(y_train) > 50000:
+        rng = np.random.default_rng(cfg["train"].get("random_state", 42))
+        idx_cv = rng.choice(len(y_train), 10000, replace=False)
+        X_cv, y_cv = X_train[idx_cv], y_train[idx_cv]
     else:
-        X_cv, y_cv = X, y
+        X_cv, y_cv = X_train, y_train
 
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     cv_scores = cross_val_score(cv_clf, X_cv, y_cv, cv=skf, scoring='accuracy', n_jobs=-1)
-    
+
     cv_mean = cv_scores.mean()
     cv_std = cv_scores.std()
     print(f"   CV Accuracy: {cv_mean:.4f} (+/- {cv_std:.4f})")
 
-    # --- 3. Full Training ---
+    # --- 4. Final Training on the training portion ---
     print("\n>>> Training Final Model...")
-    sss = StratifiedShuffleSplit(n_splits=1, test_size=cfg["train"].get("test_size", 0.2), random_state=cfg["train"].get("random_state", 42))
-    train_idx, test_idx = next(sss.split(X, y))
-    
-    X_train, X_test = X[train_idx], X[test_idx]
-    y_train, y_test = y[train_idx], y[test_idx]
     
     # Get filenames for test set
     if filenames:
