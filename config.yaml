@@ -1,0 +1,111 @@
+# ===== Project paths =====
+output:
+  dir: "./outputs_int8"
+
+# ===== Model Selection (Tournament) =====
+models:
+  candidates:
+    # Isotropic vision transformers
+    - "vit_base_patch16_224"
+    - "vit_small_patch16_224"
+    - "vit_small_patch32_224"
+    - "vit_small_r26_s32_224"
+    - "vit_tiny_patch16_384"
+    - "deit3_small_patch16_224"
+    # Hierarchical vision transformers
+    - "tiny_vit_21m_224"
+    - "tiny_vit_21m_384"
+    - "tiny_vit_11m_224"
+    - "tiny_vit_5m_224"
+    - "swin_small_patch4_window7_224"
+    - "swin_tiny_patch4_window7_224"
+    - "pvt_v2_b1"
+    # Efficiency oriented transformers for edge inference
+    - "mobilevitv2_100"
+    - "efficientformerv2_s1"
+
+  # Metric to decide the winner
+  selection_metric: "cv_accuracy_mean"   # chosen on the training partition, see paper Section 3.6 
+
+  # Common settings
+  pooling: "cls"
+  img_size: null
+
+# ===== Runtime =====
+runtime:
+  device: "cpu"
+  batch_size: 64
+  num_workers: 4
+  # Set to false for the FP32 pass and true for the INT8 pass. Point
+  # output.dir at a different folder for each pass so the two sets of
+  # encodings and metrics do not overwrite each other.
+  quantize: true
+
+# ===== Dataset =====
+data:
+  root: "./Dataset"
+  extensions: [".jpg", ".jpeg", ".png", ".bmp"]
+
+# ===== SVM training (Step 2) =====
+train:
+  test_size: 0.2
+  random_state: 42
+  standardize: true
+  class_weight: "balanced"
+  C: 1.0
+  max_iter: 2000
+  
+  # Evaluation Settings
+  tsne_samples: 1000  # Max samples to plot (prevent crash on large data)
+
+# ===== Explainability (Winner Only) =====
+explain:
+  # Set to false for a pass whose explanations are not reported, for example a
+  # full precision sweep, so the expensive stage is skipped entirely.
+  enabled: true
+  images_dir: "./images_GT/images"
+  masks_dir:  "./images_GT/masks"
+  mask_suffix: "_mask"
+  thresholds: [0.3, 0.5, 0.7]
+  save_vis: true
+  overlay_alpha: 0.6
+  resume: true
+
+  # Faithfulness Metric
+  faithfulness:
+    enabled: true
+    mask_top_percent: 0.20  # Hide top 20% important pixels to test logic
+
+  methods:
+    rollout: true
+    lime: true
+    rise: true
+    shap: true
+
+  lime:
+    num_samples: 500
+    num_features: 10
+    hide_color: 0
+    segments: 100
+
+  rise:
+    N: 1000
+    p: 0.5
+    sizes: [8, 12, 16]
+    jitter: 16
+    smooth_sigma: 1.0
+  
+  rise_vis:
+    mode: "topk"
+    topk_percent: 10
+    color: [0, 255, 0]
+
+  shap:
+    nsamples: 300
+
+# ===== Advanced =====
+advanced:
+  strict_local_load: false
+  # Leave false. When true, a checkpoint is accepted on partial name
+  # overlap, which can load a sibling variant such as dist_in22k.
+  allow_fuzzy_checkpoint: false
