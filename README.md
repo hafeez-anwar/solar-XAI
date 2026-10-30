@@ -1,100 +1,194 @@
 # solar-XAI
-# Model Tournament & Comprehensive Evaluation Pipeline
 
-An automated machine learning pipeline for evaluating, comparing, and explaining model candidates. The system runs a "tournament" across multiple configurations, scores them against comprehensive evaluation metrics (CV Accuracy, AUC, F1, Inference Speed, t-SNE), generates an aggregated leaderboard, and automatically applies Explainable AI (XAI) techniques to the winning model.
+Image based soiling detection for photovoltaic panels. A pre-trained Vision Transformer encodes
+each panel image, a linear support vector machine classifies the encoding as Clean or Dusty, and the
+resulting decisions are audited with LIME, RISE and SHAP against hand drawn masks.
 
-## 🚀 Features
+This repository contains the code for the paper *SolCleanTransform: An Explainable Hybrid Vision
+Transformer Framework for Image-based Photovoltaic Soiling Detection*.
 
-- **Automated Pipeline**: End-to-end execution from data encoding to model training and interpretability.
-- **Comprehensive Leaderboard**: Ranks models based on Cross-Validation Accuracy, AUC, Model Parameters, Inference Runtime, and t-SNE Clustering metrics.
-- **Explainable AI (XAI)**: Automatically isolates the top-performing model and applies LIME, RISE, SHAP, and Rollout to interpret its decisions, including Faithfulness and Runtime calculations.
-- **Configuration-Driven**: Easily swap candidate models, input data, and selection metrics via YAML configuration.
+## Pipeline
 
-## 💻 System Requirements
+| Stage | Script | Output |
+|---|---|---|
+| Encode images with a candidate backbone, measure parameters and latency | `step1_encode.py` | `<model>/encodings/features.npy`, `<model>/efficiency.json` |
+| Train and evaluate the linear SVM, write plots and error analysis | `step2_svm_train.py` | `<model>/models/<model>_metrics.json`, `<model>/plots/`, `<model>/error_analysis/` |
+| Explain the chosen model with LIME, RISE, SHAP and attention rollout | `step3_explain.py` | `explanations/<model>/<method>/metrics_<method>.csv` |
+| Run every candidate and aggregate the leaderboard | `main.py` | `model_leaderboard.xlsx` |
 
-- **Python**: 3.8 or higher
-- **Hardware**: CUDA-enabled NVIDIA GPU is highly recommended for faster feature extraction and model interpretability. CPU execution is supported but will run significantly slower.
+## Requirements
 
-## 💾 Datasets Configuration
+Python 3.8 or newer with `torch`, `torchvision`, `timm`, `scikit-learn`, `numpy`, `pandas`,
+`matplotlib`, `seaborn`, `pyyaml`, `openpyxl`, `lime` and `shap`.
 
-This pipeline requires two sets of data to run successfully: the main training/evaluation dataset and a subset of ground truth images for Explainable AI (XAI) evaluation. 
+Pin the `timm` version you use and record it, because the layout of `forward_features` output is not
+uniform across architectures. TinyViT and the hybrids emit NCHW while Swin emits NHWC. The pooling in
+`vit_forward_embeddings` relies on `timm`'s own classifier head, created with `num_classes=0`, which
+pools correctly for every family. Reverting to a hand written mean over the last two axes silently
+reduces Swin features to a vector of length H and collapses its accuracy to the majority class rate.
 
-### 1. Main Dataset (`Dataset/`)
-Due to its size (GBs), the main dataset is hosted externally and is not included in this repository. 
-1. Download the dataset from: [Google Drive Link](https://drive.google.com/file/d/1b8rcGBcd71clYMl15y_c5Txwlsvpzyv8/view?usp=sharing)
-2. Extract it into a folder named `Dataset` at the root level. It must contain the `Clean` and `Dirty` subfolders.
+A CUDA GPU speeds up encoding but is not required. All results in the paper were produced on CPU.
 
-### 2. XAI Ground Truth Dataset (`images_GT/`)
-This dataset is used in Phase 3 to evaluate the faithfulness of the XAI methods on the winning model. 
-1. Download the dataset from: [Google Drive Link](https://drive.google.com/drive/folders/1WbJbX74HOI-3PrJrD-nBc5_oa0Z1Aqvq?usp=drive_link)
-2. Place the `images_GT/` folder at the root level of this project.
-3. It must contain exactly two subfolders:
-   - `images/`: Contains the 20 raw sample images.
-   - `masks/`: Contains the 20 corresponding binary masks for those images.
+## Datasets
 
-### Required Folder Structure
-Before running the pipeline, ensure your project directory looks exactly like this:
+Two sets of images are needed. Neither is stored in this repository.
+
+### 1. Main dataset (`Dataset/`)
+
+The images originate from the publicly available *Solar Panel Dust Detection* collection on Kaggle
+(https://www.kaggle.com/datasets/pythonafroz/solar-panel-dust-detection), which contains 1,068
+images. Because that collection was assembled from online sources, the same scene sometimes appears
+twice, once as a thumbnail and once at full size, and resizing every input to a fixed resolution
+makes such a pair effectively identical. The copy used in the paper has been inspected manually and
+the redundant images removed, which leaves **1,056 images, 405 Clean and 651 Dirty**.
+
+Download the cleaned copy used in the paper:
+https://drive.google.com/file/d/1b8rcGBcd71clYMl15y_c5Txwlsvpzyv8/view?usp=sharing
+
+Extract it into a folder named `Dataset` at the project root, containing the `Clean` and `Dirty`
+subfolders.
+
+### 2. XAI ground truth (`images_GT/`)
+
+Twenty dusty panel images with hand drawn binary masks, where white marks the soiled area. Used in
+stage 3 to score localisation and faithfulness.
+
+Download: https://drive.google.com/drive/folders/1WbJbX74HOI-3PrJrD-nBc5_oa0Z1Aqvq?usp=drive_link
+
+Place `images_GT/` at the project root with exactly two subfolders, `images/` and `masks/`.
+
+### Expected layout
 
 ```text
-├── Dataset/                  <-- Main dataset (Downloaded externally)
-│   ├── Clean/
-│   └── Dirty/
-├── images_GT/                <-- XAI evaluation dataset
-│   ├── images/               <-- 20 sample images
-│   └── masks/                <-- 20 corresponding binary masks
-├── outputs/                  <-- Auto-generated during execution
-├── config-encode.yaml
+.
+├── Dataset/
+│   ├── Clean/          405 images
+│   └── Dirty/          651 images
+├── images_GT/
+│   ├── images/         20 images
+│   └── masks/          20 masks, suffix _mask
+├── config.yaml
 ├── main.py
 ├── step1_encode.py
 ├── step2_svm_train.py
 └── step3_explain.py
 ```
 
-## 🚀 How to Run the Project
+## Configuration
 
-### 1. Local Setup & Installation
-Run the following commands in your terminal to clone the repository and install the required dependencies:
+Everything is driven by `config.yaml`. The settings that change results:
+
+| Key | Meaning |
+|---|---|
+| `models.candidates` | The list of `timm` model names to evaluate |
+| `models.selection_metric` | Metric used to pick the model passed to stage 3. Set to `cv_accuracy_mean` so the choice is made on the training partition, matching the paper |
+| `train.test_size`, `train.random_state` | Stratified holdout split, 0.2 and 42 in the paper |
+| `train.C`, `train.class_weight` | Linear SVM regularisation and class weighting, 1.0 and balanced |
+| `runtime.quantize` | `false` for the FP32 pass, `true` for the dynamic INT8 pass |
+| `advanced.allow_fuzzy_checkpoint` | Leave `false`. When true a checkpoint is accepted on partial name overlap and a sibling variant can be loaded instead |
+| `explain.enabled` | Set `false` to skip the explainability stage for this pass |
+| `explain.faithfulness.mask_top_percent` | Fraction of most important pixels masked when scoring faithfulness, 0.20 in the paper |
+| `explain.lime`, `explain.rise`, `explain.shap` | Per method sampling budgets, which are not equal across methods |
+
+## Running
+
+The runner is incremental. For each candidate it inspects what is already on disk and
+repeats only what is missing:
+
+| State found | Action |
+|---|---|
+| `encodings/features.npy` and `models/<model>_metrics.json` both present | model treated as processed, results read from disk |
+| encodings present, metrics missing | stage 1 skipped, stage 2 run |
+| neither present | both stages run |
+
+The leaderboard is rebuilt from every processed model on each run, so
+`model_leaderboard.xlsx` always reflects the full candidate list rather than only the
+models touched in that invocation.
+
+The explainability stage is the expensive one, so it runs only when it has to. After the
+leaderboard is written, the winner is taken from `models.selection_metric` and compared
+with the winner of record in `winner.json`. The stage runs when the winner has changed,
+when its explanation files are missing or all empty, or when `--force-explain` is given.
+If the winner is unchanged and its explanations are present, the stage is skipped and the
+previous results stand. Set `explain.enabled: false` to skip the stage regardless, which
+is appropriate for a sweep whose explanations are not reported.
+
+Candidates that tie on the selection metric are resolved in favour of one whose
+explanations already exist, so two entries that resolve to the same pre-trained weights
+do not trigger a repeat.
 
 ```bash
-# Clone the repository
-git clone [https://github.com/hafeez-anwar/solar-XAI.git](https://github.com/hafeez-anwar/solar-XAI.git)
-cd solar-XAI
+# Full precision:  runtime.quantize: false   output.dir: "./outputs_fp32"
+python main.py --config config.yaml
 
-# Create and activate a virtual environment (optional but recommended)
-# On Windows:
-python -m venv venv
-venv\Scripts\activate
-# On Mac/Linux:
-# source venv/bin/activate
-
-# Install required Python packages
-pip install torch torchvision scikit-learn pandas pyyaml shap lime opencv-python tqdm openpyxl
+# Dynamic INT8:    runtime.quantize: true    output.dir: "./outputs_int8"
+python main.py --config config.yaml
 ```
 
-### 2. Execute the Pipeline
-Once your datasets are placed in the root directory, execute the master script to start the tournament:
+Override the checks when needed:
 
 ```bash
-python main.py --config config-encode.yaml
+python main.py --config config.yaml --force-encode    # re-encode every candidate
+python main.py --config config.yaml --force-train     # retrain every SVM
+python main.py --config config.yaml --force-explain   # re-run the explainability stage
 ```
 
-## 🎛️ Pipeline Customization (`config-encode.yaml`)
+Adding a new model to `models.candidates` therefore costs only that model's encoding and
+training, plus the explainability stage if the addition takes the top of the leaderboard.
 
-You can modify how the tournament runs by editing settings in `config-encode.yaml`:
-- **`candidates`**: Add or remove candidate model architecture names to customize which models compete.
-- **`selection_metric`**: Change the benchmark used to select the winning model (e.g., `accuracy`, `auc`, `f1`).
-- **`explain.methods`**: Enable or disable specific XAI algorithms (`lime`, `shap`, `rise`, `rollout`).
+Before committing to a long run, check that new candidates build, survive quantization and
+produce a sensible feature dimension:
 
-## ⚙️ Pipeline Workflow
+```bash
+python check_candidates.py --config config.yaml
+```
 
-1. **Phase 1 (Encode)**: Computes features/embeddings for all models and extracts efficiency metrics (`efficiency.json`).
-2. **Phase 2 (Train)**: Evaluates all candidates in the config via SVM, performing cross-validation and outputting predictive performance metrics.
-3. **Leaderboard Generation**: Aggregates all metrics into `model_leaderboard.xlsx` and identifies the winner based on `selection_metric`.
-4. **Phase 3 (Explain)**: Triggers the XAI script exclusively on the winning model to generate feature attribution heatmaps and faithfulness reports against `images_GT`.
+## Evaluation protocol
 
-## 📊 Expected Outputs
+`step2_svm_train.py` creates the stratified holdout partition first, then runs five fold stratified
+cross validation **on the training partition only**, and finally trains on the training partition and
+evaluates once on the holdout partition. Candidate ranking therefore uses cross validation accuracy
+and the holdout accuracy is reported for the selected model. An earlier version of this script ran
+the folds over the complete encoded set, which made the two estimates overlap.
 
-Upon completion, check the auto-generated `outputs/` directory for:
-- `model_leaderboard.xlsx`: Complete ranked spreadsheet comparing model architectures across accuracy, parameters, and inference latency.
-- **Model Subdirectories**: Subfolders for each candidate model containing their extracted feature representations and JSON logs.
-- **Winning Model Visualizations**: Explanation heatmaps, generated feature masks, and faithfulness quantitative score reports.
+Probabilities come from `CalibratedClassifierCV` wrapped around `LinearSVC`, so the confidence values
+in `error_analysis/error_report.csv` and in the confidence histogram are Platt scaled.
+
+## Outputs
+
+* `efficiency.json` records `params_M` counted on the full precision graph, `inference_ms` as the
+  median of 100 timed single image forward passes after ten warm-up passes, `inference_ms_iqr`,
+  `precision`, and the resolved `weights` path.
+* `<model>_metrics.json` records holdout accuracy, macro F1, macro precision and recall, AUC, the
+  cross validation mean and standard deviation, and the t-SNE silhouette and KL divergence.
+* `error_analysis/error_report.csv` lists every misclassified holdout image with its true label,
+  predicted label and calibrated confidence. Comparing this file between the two passes gives the
+  discordant counts for a paired McNemar test.
+* `explanations/<model>/<method>/metrics_<method>.csv` gives per image IoU and Dice at thresholds
+  0.3, 0.5 and 0.7, the faithfulness drop, and the runtime in seconds.
+
+## Known behaviour
+
+* `torch.quantization.quantize_dynamic` converts the weights of `nn.Linear` modules only.
+  Architectures whose projections are implemented as pointwise convolutions are therefore
+  left untouched, and the INT8 pass reproduces the FP32 encodings byte for byte. In our
+  runs this applies to `mobilevitv2_100` and `efficientformerv2_s1`, whose metrics are
+  identical in both passes. Check this by comparing `features.npy` between the two output
+  directories before attributing any difference, or any absence of one, to quantization.
+* Some architectures cannot be quantized at all. `convit_tiny` raises during the forward
+  pass after `quantize_dynamic`, because its gated positional self attention accesses the
+  `nn.Linear` modules that the procedure replaces. The run then stops at the feature
+  dimension probe, leaving an `efficiency.json` with `inference_ms: 0.0`, a header-only
+  `progress.csv` and no encodings. Use `check_candidates.py` to detect this in advance.
+* Attention rollout writes an empty metrics file for architectures it cannot traverse. The
+  file is created but contains no rows, and the incremental runner tolerates that rather
+  than repeating the stage.
+* Latency measured while other work runs on the same host varies considerably. Timings
+  intended for publication should be taken on an otherwise idle machine.
+* Encodings are precision specific. Keep a separate `output.dir` per pass, since the
+  incremental check treats a model as processed once its encodings and metrics exist.
+
+## Citation
+
+Farman H., Anwar H., Nasralla M., Sedik A. *SolCleanTransform: An Explainable Hybrid Vision
+Transformer Framework for Image-based Photovoltaic Soiling Detection.*
