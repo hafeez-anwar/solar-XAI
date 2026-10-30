@@ -47,7 +47,9 @@ def load_yaml_config(path: Path) -> dict:
     cfg["model"].setdefault("name","vit_base_patch16_224"); cfg["model"].setdefault("pooling","cls"); cfg["model"].setdefault("img_size", None)
     cfg.setdefault("runtime", {}); cfg["runtime"].setdefault("batch_size", 32); cfg["runtime"].setdefault("device","cpu"); cfg["runtime"].setdefault("num_workers", 4)
     cfg.setdefault("cache", {}); cfg["cache"].setdefault("hf_hub_root", str(Path.home()/".cache"/"huggingface"/"hub"))
+    cfg["runtime"].setdefault("quantize", True)
     cfg.setdefault("advanced", {}); cfg["advanced"].setdefault("strict_local_load", False)
+    cfg["advanced"].setdefault("allow_fuzzy_checkpoint", False)
     
     if "model_override" in cfg:
         cfg["model"]["name"] = cfg["model_override"]
@@ -85,28 +87,38 @@ def build_transform(model, forced_size: Optional[int]) -> tuple:
     tr = transforms.Compose([transforms.Resize((size,size)), transforms.ToTensor(), transforms.Normalize(mean,std)])
     return tr, size, mean, std
 
+TIMING_WARMUP = 10
+TIMING_ITERS = 100
+
 def measure_efficiency(model, device, input_size=(1, 3, 224, 224)):
-    """Calculates param count and inference speed."""
+    """Parameter count and single image inference latency.
+
+    Latency is the median of TIMING_ITERS timed runs taken after
+    TIMING_WARMUP warm-up runs, measured with perf_counter on a batch of
+    one. The median is reported because the mean of a short timing loop on
+    a shared CPU is dominated by scheduling outliers. The returned value
+    covers the encoder forward pass only and excludes image loading,
+    preprocessing and the downstream SVM.
+    """
     param_count = sum(p.numel() for p in model.parameters()) / 1e6 # in Millions
     dummy = torch.randn(input_size).to(device)
-    
-    # Temporarily disable quantization for clean speed test if needed, 
-    # but strictly speaking we want to measure the ACTUAL speed (quantized).
-    # So we keep it as is.
+
     model.eval()
     try:
         with torch.no_grad():
-            for _ in range(5): _ = model(dummy) # Warmup
-            t0 = time.time()
-            iters = 20
-            for _ in range(iters): _ = model(dummy)
-            total_time = time.time() - t0
-        ms_per_image = (total_time / iters) * 1000
+            for _ in range(TIMING_WARMUP): _ = model(dummy)
+            times = []
+            for _ in range(TIMING_ITERS):
+                t0 = time.perf_counter()
+                _ = model(dummy)
+                times.append((time.perf_counter() - t0) * 1000.0)
+        ms_per_image = float(np.median(times))
+        ms_iqr = float(np.percentile(times, 75) - np.percentile(times, 25))
     except Exception as e:
         print(f"Warning: Speed test failed ({e}). Returning 0.")
-        ms_per_image = 0
-        
-    return param_count, ms_per_image
+        ms_per_image, ms_iqr = 0.0, 0.0
+
+    return param_count, ms_per_image, ms_iqr
 
 @torch.inference_mode()
 def vit_forward_embeddings(model, x: torch.Tensor, pooling: str) -> torch.Tensor:
@@ -114,28 +126,36 @@ def vit_forward_embeddings(model, x: torch.Tensor, pooling: str) -> torch.Tensor
     Extracts feature embeddings. 
     Adapts to both 3D (ViT) and 4D (CNN/Hierarchical ViT) outputs.
     """
-    out = model.forward_features(x)
+    # Models are created with num_classes=0, so timm's own head performs the
+    # pooling each architecture expects: class token for isotropic ViTs and
+    # global average pooling for hierarchical ones. Relying on it avoids
+    # guessing the memory layout of the feature map, which is not uniform
+    # across families. TinyViT and the hybrids emit NCHW while Swin emits
+    # NHWC, so averaging a fixed pair of axes collapses Swin features to a
+    # vector of length H instead of C.
+    out = model(x)
 
-    # 1. Handle models returning multiple stages (tuple/list)
     if isinstance(out, (list, tuple)):
         out = out[-1]
 
-    # 2. Handle 2D: Already a flat vector (B, Num_Classes) or (B, Dim)
     if out.ndim == 2:
         return out
 
-    # 3. Handle 3D: Standard ViT (Batch, Patches, Dim)
+    # Fallback for any model whose forward still returns an unpooled map.
     if out.ndim == 3:
         if pooling == "cls":
             return out[:, 0]
         else:
             return out[:, 1:].mean(dim=1)
 
-    # 4. Handle 4D: CNN or Hierarchical ViT (Batch, Dim, Height, Width)
-    elif out.ndim == 4:
-        return out.mean(dim=(-2, -1)) # Global Average Pooling
+    if out.ndim == 4:
+        fmt = getattr(model, "output_fmt", None)
+        fmt = str(getattr(fmt, "value", fmt)).upper()
+        if fmt == "NHWC":
+            return out.mean(dim=(1, 2))
+        return out.mean(dim=(-2, -1)) # Global Average Pooling over H and W
 
-    raise RuntimeError(f"Unexpected feature shape {out.shape}")
+    raise RuntimeError(f"Unexpected feature shape {tuple(out.shape)}")
 
 # --- Fast Data Loading ---
 class FastImageDataset(Dataset):
@@ -224,7 +244,21 @@ def load_local_checkpoint_into_timm(model, ckpt_path: Path, strict_local: bool) 
         try:
             model.load_state_dict(sd, strict=True)
         except Exception:
-            model.load_state_dict(sd, strict=False)
+            incompatible = model.load_state_dict(sd, strict=False)
+            missing = list(getattr(incompatible, "missing_keys", []))
+            unexpected = list(getattr(incompatible, "unexpected_keys", []))
+            if missing or unexpected:
+                msg = (f"[cache] Partial load from {ckpt_path.name}: "
+                       f"{len(missing)} missing and {len(unexpected)} unexpected keys.")
+                if strict_local:
+                    raise RuntimeError(msg)
+                print(msg, file=sys.stderr)
+                # A checkpoint from a different variant leaves most of the
+                # network randomly initialised, which previously passed
+                # unnoticed. Reject it and fall back to the proper weights.
+                if len(missing) > 0.05 * len(model.state_dict()):
+                    print("[cache] Rejecting this checkpoint.", file=sys.stderr)
+                    return False
         return True
     except Exception as e:
         if strict_local: raise
@@ -291,34 +325,58 @@ def main():
     strict_local = bool(cfg["advanced"].get("strict_local_load", False))
     
     model = None
-    
-    # Checkpoints
+    ckpt_used = None
+
+    # Checkpoints. The exact HuggingFace cache directory for this model name is
+    # tried first. The token based matcher below is permissive enough to return
+    # the checkpoint of a sibling variant, for example the dist_in22k weights
+    # when the plain name was requested, so it is only consulted when
+    # advanced.allow_fuzzy_checkpoint is set.
     ckpt_path = find_hf_timm_checkpoint(cfg["model"]["name"], hub_root)
     if ckpt_path:
         model = timm.create_model(cfg["model"]["name"], pretrained=False, num_classes=0)
-        load_local_checkpoint_into_timm(model, ckpt_path, strict_local)
-    
-    if model is None:
+        if load_local_checkpoint_into_timm(model, ckpt_path, strict_local):
+            ckpt_used = ckpt_path
+        else:
+            model = None
+
+    if model is None and bool(cfg["advanced"].get("allow_fuzzy_checkpoint", False)):
         torch_ckpt = find_torch_checkpoint(cfg["model"]["name"], torch_ckpt_dir)
         if torch_ckpt:
+            print(f"[cache] Fuzzy checkpoint match: {torch_ckpt.name}", file=sys.stderr)
             model = timm.create_model(cfg["model"]["name"], pretrained=False, num_classes=0)
-            load_local_checkpoint_into_timm(model, torch_ckpt, False)
+            if load_local_checkpoint_into_timm(model, torch_ckpt, False):
+                ckpt_used = torch_ckpt
+            else:
+                model = None
 
     if model is None:
         print("[cache] Downloading/Loading weights via timm...", file=sys.stderr)
         model = timm.create_model(cfg["model"]["name"], pretrained=True, num_classes=0)
+        ckpt_used = "timm pretrained"
+    print(f"Weights: {ckpt_used}")
 
     model.eval()
 
-    # --- Optimization: Quantization ---
-    if device.type == "cpu":
-        print(f"⚡ Applying Dynamic Quantization for CPU speedup...")
+    # Parameters are counted on the full precision graph. quantize_dynamic
+    # replaces nn.Linear with quantized modules whose weights are no longer
+    # returned by model.parameters(), which would otherwise report a fraction
+    # of the true model size.
+    params_m = sum(p.numel() for p in model.parameters()) / 1e6
+
+    # --- Optimization: Dynamic Quantization (runtime.quantize) ---
+    precision = "fp32"
+    if bool(cfg["runtime"].get("quantize", True)) and device.type == "cpu":
+        print("Applying dynamic INT8 quantization to Linear layers...")
         try:
             model = torch.quantization.quantize_dynamic(
                 model, {torch.nn.Linear}, dtype=torch.qint8
             )
+            precision = "int8"
         except Exception as e:
             print(f"Warning: Quantization failed ({e}), continuing with fp32.")
+    else:
+        print("Running at full precision (runtime.quantize is false or device is not CPU).")
 
     model.to(device)
     transform, used_size, mean, std = build_transform(model, cfg["model"]["img_size"])
@@ -326,12 +384,18 @@ def main():
     # --- Efficiency Measurement ---
     print("Measuring efficiency metrics...", flush=True)
     dummy_shape = (1, 3, used_size, used_size)
-    params_m, inference_ms = measure_efficiency(model, device, dummy_shape)
-    print(f"  > Params: {params_m:.2f} M")
-    print(f"  > Inference (Quantized): {inference_ms:.2f} ms/img")
-    
+    _, inference_ms, inference_iqr = measure_efficiency(model, device, dummy_shape)
+    print(f"  > Params: {params_m:.2f} M (counted at full precision)")
+    print(f"  > Inference ({precision}): {inference_ms:.2f} ms/img (median, IQR {inference_iqr:.2f})")
+
     with open(efficiency_path, "w") as f:
-        json.dump({"params_M": params_m, "inference_ms": inference_ms}, f)
+        json.dump({"params_M": params_m,
+                   "inference_ms": inference_ms,
+                   "inference_ms_iqr": inference_iqr,
+                   "timing_warmup": TIMING_WARMUP,
+                   "timing_iters": TIMING_ITERS,
+                   "precision": precision,
+                   "weights": str(ckpt_used)}, f)
 
     # Infer feature dim D
     try:
