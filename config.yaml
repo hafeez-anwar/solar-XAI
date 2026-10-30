@@ -50,10 +50,9 @@ data:
 train:
   test_size: 0.2
   random_state: 42
-  standardize: true
   class_weight: "balanced"
   C: 1.0
-  max_iter: 2000
+  max_iter: 10000   # value used by step2_svm_train.py
   
   # Evaluation Settings
   tsne_samples: 1000  # Max samples to plot (prevent crash on large data)
