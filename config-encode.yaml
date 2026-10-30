@@ -5,24 +5,27 @@ output:
 # ===== Model Selection (Tournament) =====
 models:
   candidates:
+    # Isotropic vision transformers
     - "vit_base_patch16_224"
-    - "vit_tiny_patch16_384"
     - "vit_small_patch16_224"
     - "vit_small_patch32_224"
     - "vit_small_r26_s32_224"
-    - "tiny_vit_11m_224.dist_in22k"
-    - "tiny_vit_11m_224"
-    - "tiny_vit_21m_224.dist_in22k"
+    - "vit_tiny_patch16_384"
+    - "deit3_small_patch16_224"
+    # Hierarchical vision transformers
     - "tiny_vit_21m_224"
     - "tiny_vit_21m_384"
-    - "tiny_vit_5m_224.dist_in22k"
+    - "tiny_vit_11m_224"
     - "tiny_vit_5m_224"
     - "swin_small_patch4_window7_224"
     - "swin_tiny_patch4_window7_224"
-    - "convit_tiny"
-   
+    - "pvt_v2_b1"
+    # Efficiency oriented transformers for edge inference
+    - "mobilevitv2_100"
+    - "efficientformerv2_s1"
+
   # Metric to decide the winner
-  selection_metric: "accuracy" 
+  selection_metric: "cv_accuracy_mean"   # chosen on the training partition, see paper Section 3.6 
 
   # Common settings
   pooling: "cls"
@@ -57,6 +60,9 @@ train:
 
 # ===== Explainability (Winner Only) =====
 explain:
+  # Set to false for a pass whose explanations are not reported, for example a
+  # full precision sweep, so the expensive stage is skipped entirely.
+  enabled: true
   images_dir: "./images_GT/images"
   masks_dir:  "./images_GT/masks"
   mask_suffix: "_mask"
