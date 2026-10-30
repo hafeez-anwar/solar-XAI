@@ -1,308 +1,457 @@
 #!/usr/bin/env python3
-import argparse, json, sys, csv, os, shutil
+"""
+Step 3: Explainability for ViT
+UPDATED: Now measures and logs 'Runtime' (Computational Cost) for every image.
+"""
+
+import argparse
+import csv
+import math
+import sys
+import time
+import os
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
-import yaml
+from PIL import Image, UnidentifiedImageError
+
+# core deps
+import torch
+import timm
+from torchvision import transforms
+import matplotlib.cm as cm
+from skimage.segmentation import slic
+
+# explainers
+from lime import lime_image
+import shap
 import joblib
-import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.svm import LinearSVC
-from sklearn.calibration import CalibratedClassifierCV
-from sklearn.model_selection import StratifiedShuffleSplit, StratifiedKFold, cross_val_score
-from sklearn.metrics import (accuracy_score, f1_score, precision_score, recall_score, 
-                             roc_auc_score, confusion_matrix, silhouette_score)
-from sklearn.manifold import TSNE
-from numpy.lib.format import open_memmap
+import cv2
 
-# Ensure plots look professional
-sns.set_style("whitegrid")
-plt.rcParams.update({'font.size': 12})
+# ---------- config helpers ----------
+IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
 
-def load_config(path, model_override=None):
-    with path.open("r") as f: cfg = yaml.safe_load(f)
-    if model_override:
-        cfg["model"] = {"name": model_override}
+def load_yaml(path: Path) -> dict:
+    import yaml
+    with path.open("r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+    
+    if "output" not in cfg or "dir" not in cfg["output"]:
+        raise ValueError("config.output.dir is required")
+    
+    if "explain" not in cfg:
+        cfg["explain"] = {}
+
+    ex = cfg["explain"]
+    
+    # Default Paths
+    if "images_dir" not in ex:
+        raise ValueError("config.explain.images_dir is required")
+
+    if "masks_dir" not in ex:
+         ex["masks_dir"] = "" 
+
+    # defaults
+    if "model" not in cfg: cfg["model"] = {}
+    cfg["model"].setdefault("pooling", "cls")
+    cfg["model"].setdefault("img_size", None)
+    
+    ex.setdefault("mask_suffix", "_mask")
+    ex.setdefault("thresholds", [0.3, 0.5, 0.7])
+    ex.setdefault("save_vis", True)
+    ex.setdefault("overlay_alpha", 0.45)
+
+    ex.setdefault("methods", {"rollout": True, "lime": True, "rise": True, "shap": True})
+    ex.setdefault("svm", {"use_trained": True})
+    
+    # Faithfulness defaults
+    if "faithfulness" not in ex:
+        ex["faithfulness"] = {"enabled": True, "mask_top_percent": 0.20}
+    ex["faithfulness"].setdefault("enabled", True)
+    ex["faithfulness"].setdefault("mask_top_percent", 0.20)
+
+    cfg.setdefault("cache", {})
     return cfg
 
-def plot_confusion_matrix(y_true, y_pred, classes, out_path):
-    cm = confusion_matrix(y_true, y_pred)
-    plt.figure(figsize=(10, 8))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
-                xticklabels=classes, yticklabels=classes)
-    plt.xlabel('Predicted')
-    plt.ylabel('True')
-    plt.title('Confusion Matrix')
-    plt.tight_layout()
-    plt.savefig(out_path)
-    plt.close()
-
-def plot_confidence_histogram(y_true, y_probs, out_path):
-    y_pred = np.argmax(y_probs, axis=1)
-    confidences = np.max(y_probs, axis=1)
-    
-    correct_mask = (y_pred == y_true)
-    incorrect_mask = ~correct_mask
-    
-    plt.figure(figsize=(10, 6))
-    plt.hist(confidences[correct_mask], bins=20, alpha=0.7, color='green', label='Correct')
-    plt.hist(confidences[incorrect_mask], bins=20, alpha=0.7, color='red', label='Incorrect')
-    plt.xlabel('Confidence Score (Probability)')
-    plt.ylabel('Count')
-    plt.title('Prediction Confidence Distribution')
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(out_path)
-    plt.close()
-
-# --- FIXED FUNCTION ---
-def analyze_errors(y_true, y_probs, filenames, classes, out_dir, data_root):
-    """
-    Identifies 'Confidently Wrong' images and copies them from data_root to out_dir.
-    """
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Ensure data_root is a Path object
-    data_root = Path(data_root)
-    
-    y_pred = np.argmax(y_probs, axis=1)
-    confidences = np.max(y_probs, axis=1)
-    
-    # 1. Collect Errors
-    errors = []
-    for i in range(len(y_true)):
-        if y_pred[i] != y_true[i]:
-            errors.append({
-                "filename": filenames[i],
-                "true_label": classes[y_true[i]] if classes else str(y_true[i]),
-                "pred_label": classes[y_pred[i]] if classes else str(y_pred[i]),
-                "confidence": confidences[i]
-            })
-    
-    # 2. Sort by Confidence (Descending) -> The "Red Bars"
-    errors.sort(key=lambda x: x["confidence"], reverse=True)
-    
-    # 3. Save CSV Report
-    csv_path = out_dir / "error_report.csv"
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["filename", "true_label", "pred_label", "confidence"])
-        writer.writeheader()
-        writer.writerows(errors)
-        
-    print(f"\n   [Analysis] Found {len(errors)} errors. Report saved to {csv_path}")
-    
-    # 4. Copy Top 10 Worst Errors for inspection
-    worst_dir = out_dir / "top_confidently_wrong_images"
-    worst_dir.mkdir(exist_ok=True)
-    
-    print(f"   [Analysis] Copying top 10 worst errors to {worst_dir}...")
-    for i, err in enumerate(errors[:10]):
-        # FIX: Combine data_root with the relative filename
-        rel_path = err["filename"]
-        src = data_root / rel_path
-        
-        # Name format: 0.99_Pred_Dog_True_Cat_filename.jpg
-        safe_name = f"{err['confidence']:.2f}_Pred_{err['pred_label']}_True_{err['true_label']}_{Path(rel_path).name}"
-        dst = worst_dir / safe_name
-        
-        try:
-            if src.exists():
-                shutil.copy(str(src), str(dst))
-            else:
-                print(f"     Warning: Image not found at {src}")
-        except Exception as e:
-            print(f"     Could not copy {src}: {e}")
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=Path, required=True)
-    parser.add_argument("--model", type=str, default=None)
-    args = parser.parse_args()
-
-    cfg = load_config(args.config, args.model)
-    model_name = cfg["model"]["name"]
-    base_dir = Path(cfg["output"]["dir"])
-    
-    # FIX: Get the actual location of images from config
-    data_root = Path(cfg["data"]["root"])
-    
-    model_root = base_dir / model_name
-    enc_dir = model_root / "encodings"
-    out_models_dir = model_root / "models"
-    plots_dir = model_root / "plots"
-    error_dir = model_root / "error_analysis" 
-    
-    out_models_dir.mkdir(parents=True, exist_ok=True)
-    plots_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"=== Step 2: Training & Evaluation for {model_name} ===")
-    
-    # --- 1. Load Data ---
-    enc_path = enc_dir / "features.npy"
-    lab_path = enc_dir / "labels.npy"
-    cls_map_path = enc_dir / "classes.json"
-    files_map_path = enc_dir / "filenames.json" 
-    
-    if not enc_path.exists():
-        print(f"Error: Features not found. Run Step 1."); sys.exit(1)
-
-    target_names = None
-    if cls_map_path.exists():
-        with open(cls_map_path, "r") as f:
-            class_to_idx = json.load(f)
-            idx_to_class = {v: k for k, v in class_to_idx.items()}
-            target_names = [idx_to_class[i] for i in range(len(idx_to_class))]
-
-    # Load Filenames
-    filenames = []
-    if files_map_path.exists():
-        with open(files_map_path, "r") as f:
-            filenames = json.load(f)
-    else:
-        print("Warning: filenames.json not found. Error analysis will lack paths.")
-
-    X = open_memmap(enc_path, mode="r")
-    y = open_memmap(lab_path, mode="r")
-
-    # --- 2. Holdout partition ---
-    # The partition is created before cross-validation so that the folds are
-    # drawn from the training portion only. Running the folds over the whole
-    # encoded set, as an earlier version of this script did, lets each fold
-    # train on images that are also in the reported test set, which makes the
-    # cross-validation accuracy and the holdout accuracy dependent on one
-    # another and inflates both.
-    print("\n>>> Creating stratified holdout partition...")
-    sss = StratifiedShuffleSplit(n_splits=1, test_size=cfg["train"].get("test_size", 0.2), random_state=cfg["train"].get("random_state", 42))
-    train_idx, test_idx = next(sss.split(X, y))
-
-    X_train, X_test = X[train_idx], X[test_idx]
-    y_train, y_test = y[train_idx], y[test_idx]
-    print(f"   Train: {len(y_train)}  Test: {len(y_test)}")
-
-    # --- 3. Cross-Validation on the training portion ---
-    print("\n>>> Running 5-Fold Cross-Validation on the training split...")
-    cv_clf = LinearSVC(
-        class_weight=cfg["train"].get("class_weight", None),
-        C=cfg["train"].get("C", 1.0),
-        max_iter=10000,
-        dual="auto"
-    )
-
-    # Subsample for CV if the training split is very large
-    if len(y_train) > 50000:
-        rng = np.random.default_rng(cfg["train"].get("random_state", 42))
-        idx_cv = rng.choice(len(y_train), 10000, replace=False)
-        X_cv, y_cv = X_train[idx_cv], y_train[idx_cv]
-    else:
-        X_cv, y_cv = X_train, y_train
-
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    cv_scores = cross_val_score(cv_clf, X_cv, y_cv, cv=skf, scoring='accuracy', n_jobs=-1)
-
-    cv_mean = cv_scores.mean()
-    cv_std = cv_scores.std()
-    print(f"   CV Accuracy: {cv_mean:.4f} (+/- {cv_std:.4f})")
-
-    # --- 4. Final Training on the training portion ---
-    print("\n>>> Training Final Model...")
-    
-    # Get filenames for test set
-    if filenames:
-        filenames_test = [filenames[i] for i in test_idx]
-    else:
-        filenames_test = [f"Image_{i}" for i in test_idx]
-
-    base_svc = LinearSVC(
-        class_weight=cfg["train"].get("class_weight", None),
-        C=cfg["train"].get("C", 1.0),
-        max_iter=10000,
-        dual="auto"
-    )
-    clf = CalibratedClassifierCV(base_svc)
-    clf.fit(X_train, y_train)
-    
-    preds = clf.predict(X_test)
-    probas = clf.predict_proba(X_test)
-    
-    acc = accuracy_score(y_test, preds)
-    f1 = f1_score(y_test, preds, average="macro")
-    prec = precision_score(y_test, preds, average="macro", zero_division=0)
-    rec = recall_score(y_test, preds, average="macro", zero_division=0)
-    
+# ---------- I/O helpers ----------
+def safe_open_rgb(path: Path) -> Image.Image:
     try:
-        if len(target_names) == 2:
-            auc = roc_auc_score(y_test, probas[:, 1])
+        im = Image.open(path); im.load()
+        if im.mode != "RGB": im = im.convert("RGB")
+        return im
+    except (UnidentifiedImageError, OSError) as e:
+        raise RuntimeError(f"Image load failed: {e}")
+
+def load_mask_binary(path: Path) -> np.ndarray:
+    im = Image.open(path); im.load()
+    arr = np.array(im)
+    if arr.ndim == 3:  
+        arr = (0.299*arr[...,0] + 0.587*arr[...,1] + 0.114*arr[...,2])
+    return (arr > 0).astype(np.uint8)
+
+def find_matching_mask(mask_dir: Path, stem: str, suffix: str) -> Optional[Path]:
+    if not mask_dir or not mask_dir.exists(): return None
+    for ext in IMG_EXTS:
+        p = mask_dir / f"{stem}{suffix}{ext}"
+        if p.exists(): return p
+    for ext in IMG_EXTS:
+        p = mask_dir / f"{stem}{ext}"
+        if p.exists(): return p
+    cands = list(mask_dir.glob(f"{stem}{suffix}.*")) or list(mask_dir.glob(f"{stem}.*"))
+    return cands[0] if cands else None
+
+def heat_overlay(img_rgb: np.ndarray, heat: np.ndarray, alpha: float=0.45) -> Image.Image:
+    cmap = cm.get_cmap("jet")
+    heat_rgb = (cmap(np.clip(heat,0,1))[..., :3] * 255).astype(np.uint8)
+    out = (alpha * heat_rgb + (1 - alpha) * img_rgb).astype(np.uint8)
+    return Image.fromarray(out, mode="RGB")
+
+def visualize_shap_overlay(img_rgb, heat_signed, mode="signed_heat", alpha=0.45):
+    h01 = np.clip((heat_signed + 1.0) / 2.0, 0.0, 1.0)
+    cmap = cm.get_cmap("seismic")
+    heat_rgb = (cmap(h01)[..., :3] * 255).astype(np.uint8)
+    out = (alpha * heat_rgb + (1 - alpha) * img_rgb).astype(np.uint8)
+    return Image.fromarray(out, "RGB")
+
+def iou_and_dice(pred_bin: np.ndarray, gt_bin: np.ndarray) -> Tuple[float, float]:
+    pred = pred_bin.astype(bool); gt = gt_bin.astype(bool)
+    inter = np.logical_and(pred, gt).sum()
+    union = np.logical_or(pred, gt).sum()
+    dice = (2.0 * inter) / (pred.sum() + gt.sum() + 1e-6)
+    iou = inter / (union + 1e-6)
+    return float(iou), float(dice)
+
+# ---------- Faithfulness Metric ----------
+def calculate_faithfulness(img_np: np.ndarray, heat: np.ndarray, predictor, top_percent: float=0.20) -> float:
+    # 1. Original Prediction
+    preds_orig = predictor(img_np[None, ...])[0]
+    prob_orig = preds_orig[1] 
+
+    # 2. Create Mask
+    flat = heat.flatten()
+    k = int(len(flat) * (1 - top_percent))
+    if k >= len(flat): k = len(flat) - 1
+    thresh = np.partition(flat, k)[k]
+    mask_important = (heat >= thresh)
+    
+    # 3. Perturb Image
+    img_masked = img_np.copy()
+    img_masked[mask_important] = 0 
+    
+    # 4. Predict on Masked
+    preds_masked = predictor(img_masked[None, ...])[0]
+    prob_masked = preds_masked[1]
+    
+    return float(prob_orig - prob_masked)
+
+# ---------- ViT + encoder ----------
+def build_transform(model, forced_size: Optional[int]):
+    cfg = timm.data.resolve_model_data_config(model)
+    mean = cfg.get("mean",(0.5,0.5,0.5)); std = cfg.get("std",(0.5,0.5,0.5))
+    native = cfg.get("input_size",(3,224,224))[1]
+    size = forced_size if (forced_size and forced_size>0) else native
+    tr = transforms.Compose([transforms.Resize((size,size)), transforms.ToTensor(), transforms.Normalize(mean,std)])
+    return tr, size
+
+@torch.inference_mode()
+def vit_forward_embeddings(model, x: torch.Tensor, pooling: str) -> torch.Tensor:
+    """
+    Extracts feature embeddings. 
+    Adapts to both 3D (ViT) and 4D (CNN/Hierarchical ViT) outputs.
+    """
+    out = model.forward_features(x)
+
+    # 1. Handle models returning multiple stages (tuple/list)
+    # We take the last one [-1] as it contains the highest-level semantic features.
+    if isinstance(out, (list, tuple)):
+        out = out[-1]
+
+    # 2. Handle 2D: Already a flat vector (B, Num_Classes) or (B, Dim)
+    if out.ndim == 2:
+        return out
+
+    # 3. Handle 3D: Standard ViT (Batch, Patches, Dim)
+    if out.ndim == 3:
+        # Default to CLS token (index 0). 
+        # If your model doesn't use CLS, you might want out.mean(dim=1)
+        if pooling == "cls":
+            return out[:, 0]
         else:
-            auc = roc_auc_score(y_test, probas, multi_class="ovr", average="macro")
-    except:
-        auc = 0.0
+            return out[:, 1:].mean(dim=1)
 
-    print(f"   Test Set Results: Acc={acc:.4f}, F1={f1:.4f}")
+    # 4. Handle 4D: CNN or Hierarchical ViT (Batch, Dim, Height, Width)
+    elif out.ndim == 4:
+        # Global Average Pooling over H and W
+        return out.mean(dim=(-2, -1))
 
-    # --- 4. Plotting & Analysis ---
-    print("   Generating Confusion Matrix...")
-    cm_path = plots_dir / f"{model_name}_confusion_matrix.png"
-    plot_classes = target_names if target_names else [str(i) for i in range(len(np.unique(y)))]
-    plot_confusion_matrix(y_test, preds, plot_classes, cm_path)
-    
-    print("   Generating Confidence Histogram...")
-    hist_path = plots_dir / f"{model_name}_confidence_hist.png"
-    plot_confidence_histogram(y_test, probas, hist_path)
+    raise RuntimeError(f"Unexpected feature shape {out.shape}")
 
-    # === FIXED: Error Analysis call with data_root ===
-    print("   Analyzing Errors (The 'Red Bars')...")
-    analyze_errors(y_test, probas, filenames_test, target_names, error_dir, data_root)
-
-    print("   Generating t-SNE...")
-    tsne_max = cfg["train"].get("tsne_samples", 1000)
-    if len(y_test) > tsne_max:
-        indices = np.random.choice(len(y_test), tsne_max, replace=False)
-        X_vis, y_vis = X_test[indices], y_test[indices]
-    else:
-        X_vis, y_vis = X_test, y_test
-        
-    tsne = TSNE(n_components=2, random_state=42, init='pca', learning_rate='auto')
-    X_emb = tsne.fit_transform(X_vis)
-    
+def try_load_vit(cfg) -> Tuple[torch.nn.Module, transforms.Compose, int]:
+    model_name = cfg["model"]["name"]
+    print(f"[Model] Loading: {model_name}")
     try:
-        kl_div = tsne.kl_divergence_
-    except:
-        kl_div = 0.0 # Sometimes not available in all sklearn versions
+        model = timm.create_model(model_name, pretrained=True, num_classes=0)
+    except Exception as e:
+        print(f"Error loading model {model_name}: {e}")
+        sys.exit(1)
         
-    sil_score = silhouette_score(X_emb, y_vis)
+    model.eval()
+    transform, used = build_transform(model, cfg["model"]["img_size"])
+    return model, transform, used
 
-    plt.figure(figsize=(10, 8))
-    scatter = plt.scatter(X_emb[:, 0], X_emb[:, 1], c=y_vis, cmap='viridis', alpha=0.7)
-    if target_names:
-        plt.legend(handles=scatter.legend_elements()[0], labels=target_names)
-    plt.title(f"t-SNE ({model_name})\nSilhouette: {sil_score:.2f} | KL: {kl_div:.2f}")
-    tsne_path = plots_dir / f"{model_name}_tsne.png"
-    plt.savefig(tsne_path)
-    plt.close()
+# ---------- Attention Rollout ----------
+@torch.inference_mode()
+def attention_rollout(model, x: torch.Tensor) -> np.ndarray:
+    attn_list = []
+    def hook_pre(m, inputs):
+        (u,) = inputs
+        B, N, C = u.shape
+        qkv = m.qkv(u)
+        qkv = qkv.reshape(B, N, 3, m.num_heads, C // m.num_heads).permute(2,0,3,1,4)
+        q, k, _ = qkv[0], qkv[1], qkv[2]
+        attn = (q @ k.transpose(-2,-1)) * m.scale
+        attn = attn.softmax(dim=-1)
+        attn_list.append(attn)
 
-    # --- 5. Save Artifacts ---
-    joblib.dump(clf, out_models_dir / f"{model_name}_svm.pkl")
+    handles = []
+    for blk in getattr(model, "blocks", []):
+        if hasattr(blk, "attn"):
+            handles.append(blk.attn.register_forward_pre_hook(hook_pre))
+    _ = model.forward_features(x)
+    for h in handles: h.remove()
+
+    if not attn_list: return np.zeros((x.shape[2], x.shape[3])) 
+
+    rollout = None
+    for A in attn_list:
+        A = A.mean(dim=1)
+        I = torch.eye(A.size(-1), device=A.device).unsqueeze(0)
+        A = (A + I)/2.0
+        A = A / A.sum(dim=-1, keepdim=True)
+        rollout = A if rollout is None else rollout @ A
+    cls_to_all = rollout[:,0,:]
+    return cls_to_all[:,1:]
+
+# ---------- predictor (ViT-embedding -> SVM) ----------
+class ImagePredictor:
+    def __init__(self, cfg, model, transform):
+        self.cfg = cfg; self.model = model; self.transform = transform
+        self.use_svm = bool(cfg["explain"]["svm"].get("use_trained", True))
+        self.model_name = cfg["model"]["name"]
+        
+        if self.use_svm:
+            project_root = Path(cfg["output"]["dir"])
+            models_root = project_root / self.model_name / "models"
+            clf_path = models_root / f"{self.model_name}_svm.pkl"
+            sca_path = models_root / f"{self.model_name}_scaler.pkl"
+            
+            self.clf = None
+            self.scaler = None
+            
+            if not clf_path.exists():
+                print(f"[Predictor] SVM not found, using distance.", file=sys.stderr)
+                self.use_svm = False
+            else:
+                self.clf = joblib.load(clf_path)
+                if sca_path.exists():
+                    self.scaler = joblib.load(sca_path)
+
+    @torch.inference_mode()
+    def __call__(self, imgs: np.ndarray) -> np.ndarray:
+        xs = []
+        for i in range(imgs.shape[0]):
+            pil = Image.fromarray(imgs[i])
+            xs.append(self.transform(pil))
+        x = torch.stack(xs, dim=0)
+        emb = vit_forward_embeddings(self.model, x, pooling=self.cfg["model"]["pooling"]).cpu().numpy()
+        
+        if self.use_svm:
+            Z = emb
+            if self.scaler is not None:
+                Z = self.scaler.transform(Z).astype(np.float32, copy=False)
+            if hasattr(self.clf, "predict_proba"):
+                return self.clf.predict_proba(Z)
+            else:
+                d = self.clf.decision_function(Z).reshape(-1)
+                p1 = 1.0 / (1.0 + np.exp(-d))
+                p0 = 1.0 - p1
+                return np.stack([p0, p1], axis=1)
+        else:
+            d = np.linalg.norm(emb, axis=1)
+            p1 = (d - d.min()) / (d.max() - d.min() + 1e-8)
+            p0 = 1.0 - p1
+            return np.stack([p0, p1], axis=1)
+
+# ---------- ROBUST Explainers ----------
+
+def lime_explain(np_img, predictor, params):
+    ns = int(params.get("num_samples", 500))
+    seg = int(params.get("segments", 100))
+    nf = int(params.get("num_features", 10))
+    hc = params.get("hide_color", 0)
+
+    explainer = lime_image.LimeImageExplainer()
+    def predict_fn(imgs): return predictor((np.clip(imgs,0,1)*255).astype(np.uint8))
     
-    metrics = {
-        "model": str(model_name),
-        "accuracy": float(acc),
-        "f1_macro": float(f1),
-        "precision_macro": float(prec),
-        "recall_macro": float(rec),
-        "auc": float(auc),
-        "cv_accuracy_mean": float(cv_mean),
-        "cv_accuracy_std": float(cv_std),
-        "tsne_kl": float(kl_div),
-        "tsne_silhouette": float(sil_score),
-        "tsne_path": str(tsne_path),
-        "cm_path": str(cm_path),
-        "hist_path": str(hist_path)
-    }
-    
-    with open(out_models_dir / f"{model_name}_metrics.json", "w") as f:
-        json.dump(metrics, f, indent=2)
+    exp = explainer.explain_instance(
+        np_img/255.0, predict_fn, top_labels=1, hide_color=hc, num_samples=ns, 
+        segmentation_fn=lambda x: slic((x*255).astype(np.uint8), n_segments=seg, compactness=10, start_label=0)
+    )
+    _, mask = exp.get_image_and_mask(exp.top_labels[0], positive_only=True, num_features=nf, hide_rest=False)
+    heat = mask.astype(np.float32)
+    return heat / (heat.max() + 1e-8)
 
-    print(f"Done. Check {error_dir} for the red-bar images!")
+def rise_explain(np_img, predictor, params):
+    H, W = np_img.shape[:2]
+    N = int(params.get("N", 800))
+    p = float(params.get("p", 0.5))
+    s_val = int(params.get("s", 7))
+    sizes = params.get("sizes", [s_val])
+    if not sizes: sizes = [s_val]
+    jitter = int(params.get("jitter", 16))
+
+    sal = np.zeros((H, W), dtype=np.float64)
+    for _ in range(N):
+        s = int(np.random.choice(sizes))
+        grid = (np.random.rand(s, s) < p).astype(np.float32)
+        big = cv2.resize(grid, (W + 2*jitter, H + 2*jitter), interpolation=cv2.INTER_LINEAR)
+        dy, dx = np.random.randint(0, 2*jitter + 1), np.random.randint(0, 2*jitter + 1)
+        mask = big[dy:dy + H, dx:dx + W][..., None]
+        prob = predictor((np_img * mask).astype(np.uint8)[None, ...])[0, 1]
+        sal += mask.squeeze() * prob
+    sal /= (N * p + 1e-8)
+    return (sal - sal.min()) / (sal.max() - sal.min() + 1e-8)
+
+def shap_explain(np_img, predictor, params):
+    K = int(params.get("superpixels", 100))
+    nsamples = int(params.get("nsamples", 300))
+    
+    H, W = np_img.shape[:2]
+    seg = slic(np_img, n_segments=K, compactness=10, start_label=0)
+    bg = cv2.GaussianBlur(np_img, (0, 0), sigmaX=3)
+    
+    def f(z):
+        imgs = np.repeat(np_img[None,...], z.shape[0], axis=0)
+        for i in range(z.shape[0]):
+            off = np.where(z[i]==0)[0]
+            if off.size>0: 
+                m = np.isin(seg, off)[...,None].astype(np.uint8)
+                imgs[i] = imgs[i]*(1-m) + bg*m
+        return predictor(imgs)[:, 1]
+        
+    expl = shap.KernelExplainer(f, np.zeros((1, int(seg.max()+1))), link="identity")
+    phi = expl.shap_values(np.ones((1, int(seg.max()+1))), nsamples=nsamples)
+    sv = np.array(phi[0] if isinstance(phi, list) else phi).reshape(-1)
+    
+    heat = np.zeros((H, W), dtype=np.float32)
+    for k in range(len(sv)): heat[seg == k] = sv[k]
+    return heat / (np.max(np.abs(heat)) + 1e-8)
+
+# ---------- Main ----------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", required=True)
+    ap.add_argument("--model", default=None)
+    args = ap.parse_args()
+
+    cfg = load_yaml(Path(args.config).expanduser().resolve())
+    if args.model: cfg["model"]["name"] = args.model
+
+    project_root = Path(cfg["output"]["dir"]).expanduser().resolve()
+    model_name = cfg["model"]["name"]
+    out_root = project_root / "explanations" / model_name
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    model, transform, _ = try_load_vit(cfg)
+    predictor = ImagePredictor(cfg, model, transform)
+
+    img_dir = Path(cfg["explain"]["images_dir"]).expanduser().resolve()
+    msk_dir = Path(cfg["explain"]["masks_dir"]).expanduser().resolve() if cfg["explain"]["masks_dir"] else None
+    suffix = cfg["explain"]["mask_suffix"]
+    images = sorted([p for p in img_dir.iterdir() if p.suffix.lower() in IMG_EXTS], key=lambda p: p.stem)
+    
+    methods = [m for m, on in cfg["explain"]["methods"].items() if on]
+    use_faith = cfg["explain"]["faithfulness"]["enabled"]
+    faith_top_p = float(cfg["explain"]["faithfulness"]["mask_top_percent"])
+
+    for m in methods:
+        print(f"\nRunning {m}...")
+        base = out_root / m
+        (base / "overlays").mkdir(parents=True, exist_ok=True)
+        csv_path = base / f"metrics_{m}.csv"
+        
+        if not csv_path.exists():
+            with csv_path.open("w", newline="") as f:
+                # HEADER NOW INCLUDES 'runtime_sec'
+                hdr = ["stem", "mask_found", "faithfulness_drop", "runtime_sec"] + sum([[f"iou@{t}", f"dice@{t}"] for t in cfg["explain"]["thresholds"]], [])
+                csv.writer(f).writerow(hdr)
+
+        for idx, img_path in enumerate(images):
+            stem = img_path.stem
+            if idx % 10 == 0: print(f" {idx}/{len(images)}: {stem}", end="\r")
+
+            rgb_pil = safe_open_rgb(img_path)
+            rgb_np = np.array(rgb_pil)
+            
+            try:
+                # --- START TIMER ---
+                t0 = time.time()
+                
+                if m == "rollout":
+                    x = transform(rgb_pil).unsqueeze(0)
+                    tokens = attention_rollout(model, x)
+                    s = int(math.sqrt(tokens.shape[-1]))
+                    heat = torch.nn.functional.interpolate(
+                        tokens.reshape(1,1,s,s), size=rgb_np.shape[:2], mode="bilinear"
+                    )[0,0].cpu().numpy()
+                elif m == "lime": 
+                    heat = lime_explain(rgb_np, predictor, cfg["explain"]["lime"])
+                elif m == "rise": 
+                    heat = rise_explain(rgb_np, predictor, cfg["explain"]["rise"])
+                elif m == "shap": 
+                    heat = shap_explain(rgb_np, predictor, cfg["explain"]["shap"])
+                
+                # --- END TIMER ---
+                runtime = time.time() - t0
+
+                if m == "shap":
+                    vis = visualize_shap_overlay(rgb_np, heat)
+                else:
+                    h_disp = (heat - heat.min()) / (heat.max() - heat.min() + 1e-8)
+                    vis = heat_overlay(rgb_np, h_disp)
+                vis.save(base / "overlays" / f"{stem}.png")
+
+                # Faithfulness
+                faith_score = 0.0
+                if use_faith:
+                    faith_score = calculate_faithfulness(rgb_np, heat, predictor, top_percent=faith_top_p)
+
+                # Metrics
+                mask_path = find_matching_mask(msk_dir, stem, suffix) if msk_dir else None
+                # Add Runtime to Row
+                row = [stem, int(bool(mask_path)), faith_score, round(runtime, 4)]
+                
+                if mask_path:
+                    gt = load_mask_binary(mask_path)
+                    if gt.shape != heat.shape:
+                        gt = np.array(Image.fromarray(gt).resize((heat.shape[1], heat.shape[0]), Image.NEAREST))
+                    
+                    h_norm = (np.abs(heat) - np.abs(heat).min()) / (np.abs(heat).max() - np.abs(heat).min() + 1e-8)
+                    
+                    for t in cfg["explain"]["thresholds"]:
+                        iou, dice = iou_and_dice((h_norm >= t).astype(np.uint8), gt)
+                        row.extend([iou, dice])
+                else:
+                    row.extend(["", ""] * len(cfg["explain"]["thresholds"]))
+
+                with csv_path.open("a", newline="") as f:
+                    csv.writer(f).writerow(row)
+                    
+            except Exception as e:
+                print(f"\nError {m} on {stem}: {e}")
+
+    print("\nExplainability complete.")
 
 if __name__ == "__main__":
     main()
