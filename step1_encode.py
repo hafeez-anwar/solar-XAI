@@ -87,38 +87,15 @@ def build_transform(model, forced_size: Optional[int]) -> tuple:
     tr = transforms.Compose([transforms.Resize((size,size)), transforms.ToTensor(), transforms.Normalize(mean,std)])
     return tr, size, mean, std
 
-TIMING_WARMUP = 10
-TIMING_ITERS = 100
-
 def measure_efficiency(model, device, input_size=(1, 3, 224, 224)):
-    """Parameter count and single image inference latency.
+    """Parameter count (in millions), measured on the full-precision graph.
 
-    Latency is the median of TIMING_ITERS timed runs taken after
-    TIMING_WARMUP warm-up runs, measured with perf_counter on a batch of
-    one. The median is reported because the mean of a short timing loop on
-    a shared CPU is dominated by scheduling outliers. The returned value
-    covers the encoder forward pass only and excludes image loading,
-    preprocessing and the downstream SVM.
+    Dynamic quantization replaces nn.Linear with quantized modules whose
+    weights are no longer returned by model.parameters(). Counting before
+    quantization therefore reflects the true model size.
     """
-    param_count = sum(p.numel() for p in model.parameters()) / 1e6 # in Millions
-    dummy = torch.randn(input_size).to(device)
-
-    model.eval()
-    try:
-        with torch.no_grad():
-            for _ in range(TIMING_WARMUP): _ = model(dummy)
-            times = []
-            for _ in range(TIMING_ITERS):
-                t0 = time.perf_counter()
-                _ = model(dummy)
-                times.append((time.perf_counter() - t0) * 1000.0)
-        ms_per_image = float(np.median(times))
-        ms_iqr = float(np.percentile(times, 75) - np.percentile(times, 25))
-    except Exception as e:
-        print(f"Warning: Speed test failed ({e}). Returning 0.")
-        ms_per_image, ms_iqr = 0.0, 0.0
-
-    return param_count, ms_per_image, ms_iqr
+    param_count = sum(p.numel() for p in model.parameters()) / 1e6
+    return param_count
 
 @torch.inference_mode()
 def vit_forward_embeddings(model, x: torch.Tensor, pooling: str) -> torch.Tensor:
@@ -384,16 +361,11 @@ def main():
     # --- Efficiency Measurement ---
     print("Measuring efficiency metrics...", flush=True)
     dummy_shape = (1, 3, used_size, used_size)
-    _, inference_ms, inference_iqr = measure_efficiency(model, device, dummy_shape)
+    params_m_check = measure_efficiency(model, device, dummy_shape)
     print(f"  > Params: {params_m:.2f} M (counted at full precision)")
-    print(f"  > Inference ({precision}): {inference_ms:.2f} ms/img (median, IQR {inference_iqr:.2f})")
 
     with open(efficiency_path, "w") as f:
         json.dump({"params_M": params_m,
-                   "inference_ms": inference_ms,
-                   "inference_ms_iqr": inference_iqr,
-                   "timing_warmup": TIMING_WARMUP,
-                   "timing_iters": TIMING_ITERS,
                    "precision": precision,
                    "weights": str(ckpt_used)}, f)
 
