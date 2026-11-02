@@ -174,8 +174,6 @@ def main():
             "t-SNE Silhouette": data.get("tsne_silhouette"),
             "t-SNE KL-Div": data.get("tsne_kl"),
             "Params (M)": data.get("params_M"),
-            "Inference (ms)": data.get("inference_ms"),
-            "Inference IQR (ms)": data.get("inference_ms_iqr"),
             "Precision": data.get("precision"),
         })
 
