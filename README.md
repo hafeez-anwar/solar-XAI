@@ -11,7 +11,7 @@ Transformer Framework for Image-based Photovoltaic Soiling Detection*.
 
 | Stage | Script | Output |
 |---|---|---|
-| Encode images with a candidate backbone, measure parameters and latency | `step1_encode.py` | `<model>/encodings/features.npy`, `<model>/efficiency.json` |
+| Encode images with a candidate backbone; measure parameter count and memory footprint | `step1_encode.py` | `<model>/encodings/features.npy`, `<model>/efficiency.json` |
 | Train and evaluate the linear SVM, write plots and error analysis | `step2_svm_train.py` | `<model>/models/<model>_metrics.json`, `<model>/plots/`, `<model>/error_analysis/` |
 | Explain the chosen model with LIME, RISE, SHAP and attention rollout | `step3_explain.py` | `explanations/<model>/<method>/metrics_<method>.csv` |
 | Run every candidate and aggregate the leaderboard | `main.py` | `model_leaderboard.xlsx` |
@@ -36,10 +36,11 @@ Two sets of images are needed. Neither is stored in this repository.
 ### 1. Main dataset (`Dataset/`)
 
 The images originate from the publicly available *Solar Panel Dust Detection* collection on Kaggle
-(https://www.kaggle.com/datasets/pythonafroz/solar-panel-dust-detection). Because that collection was assembled from online sources, the same scene sometimes appears
-twice, once as a thumbnail and once at full size, and resizing every input to a fixed resolution
-makes such a pair effectively identical. The copy used in the paper has been inspected manually and
-the redundant images removed, which leaves **1,056 images, 405 Clean and 651 Dirty**.
+(https://www.kaggle.com/datasets/pythonafroz/solar-panel-dust-detection). Because that collection 
+was assembled from online sources, the same scene sometimes appears twice, once as a thumbnail and 
+once at full size, and resizing every input to a fixed resolution makes such a pair effectively identical. 
+The copy used in the paper has been inspected manually and the redundant images removed, 
+which leaves **1,056 images, 405 Clean and 651 Dirty**.
 
 Download the cleaned copy used in the paper:
 https://drive.google.com/file/d/1b8rcGBcd71clYMl15y_c5Txwlsvpzyv8/view?usp=sharing
@@ -153,6 +154,27 @@ the folds over the complete encoded set, which made the two estimates overlap.
 Probabilities come from `CalibratedClassifierCV` wrapped around `LinearSVC`, so the confidence values
 in `error_analysis/error_report.csv` and in the confidence histogram are Platt scaled.
 
+## Selecting the encoder
+
+Selection uses both passes and runs after `main.py` has completed at FP32 and at INT8 and
+after `measure_memory.py` has written `memory_footprint.csv`.
+
+```bash
+python step4_select.py --config config.yaml --fp32-dir outputs --int8-dir outputs_int8
+```
+
+Stage 1 ranks every candidate by cross-validation accuracy in each pass and keeps the five
+with the best poorer rank. Cross-validation runs on the training partition only, so the
+holdout images take no part in forming the shortlist.
+
+Stage 2 treats stability and memory as admission requirements rather than as scores. A
+shortlisted candidate qualifies when its holdout accuracy moves by at most `--max-delta`
+images between the two precisions and when quantization removes at least `--min-reduction`
+percent of its stored size. The qualifying candidate with the highest mean cross-validation
+accuracy is selected, ties within `--cv-tol` going to the smaller quantized encoder. The
+defaults are 5 images, 50 percent and 0.01, and they select `tiny_vit_11m_224`. Results go to
+`selection.json` and `selection_tournament.csv`.
+
 ## Memory footprint
 
 `measure_memory.py` records the serialised size of each candidate encoder before and after
@@ -170,9 +192,9 @@ are convolutions.
 
 ## Outputs
 
-* `efficiency.json` records `params_M` counted on the full precision graph, `inference_ms` as the
-  median of 100 timed single image forward passes after ten warm-up passes, `inference_ms_iqr`,
-  `precision`, and the resolved `weights` path.
+* `efficiency.json` records `params_M` counted on the full precision graph, `precision`
+  (`fp32` or `int8`), and the resolved `weights` path.
+  For per-model stored encoder sizes in MiB run `measure_memory.py` (see **Memory footprint** above).
 * `<model>_metrics.json` records holdout accuracy, macro F1, macro precision and recall, AUC, the
   cross validation mean and standard deviation, and the t-SNE silhouette and KL divergence.
 * `error_analysis/error_report.csv` lists every misclassified holdout image with its true label,
@@ -180,8 +202,6 @@ are convolutions.
   discordant counts for a paired comparison of the two precisions on the same images.
 * `explanations/<model>/<method>/metrics_<method>.csv` gives per image IoU and Dice at thresholds
   0.3, 0.5 and 0.7, the faithfulness drop, and the runtime in seconds.
-
-
 
 ## Citation
 
