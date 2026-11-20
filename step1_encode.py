@@ -39,6 +39,13 @@ except Exception:
 
 IMG_EXTS_DEFAULT = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 
+# --- Timing protocol (reported in the paper, Section 3.6) ---
+# Latency is the median of TIMING_ITERS timed forward passes taken after
+# TIMING_WARMUP warm-up passes, at a batch size of one, with the process
+# restricted to four CPU threads (set above).
+TIMING_WARMUP = 10
+TIMING_ITERS = 100
+
 # ---------------- utils ----------------
 def load_yaml_config(path: Path) -> dict:
     with path.open("r", encoding="utf-8") as f: cfg = yaml.safe_load(f)
@@ -88,14 +95,39 @@ def build_transform(model, forced_size: Optional[int]) -> tuple:
     return tr, size, mean, std
 
 def measure_efficiency(model, device, input_size=(1, 3, 224, 224)):
-    """Parameter count (in millions), measured on the full-precision graph.
+    """Parameter count (in millions) and single image inference latency.
 
-    Dynamic quantization replaces nn.Linear with quantized modules whose
-    weights are no longer returned by model.parameters(). Counting before
-    quantization therefore reflects the true model size.
+    Parameters are counted on the full-precision graph. Dynamic quantization
+    replaces nn.Linear with quantized modules whose weights are no longer
+    returned by model.parameters(), so counting before quantization reflects
+    the true model size.
+
+    Latency is the median of TIMING_ITERS timed runs taken after
+    TIMING_WARMUP warm-up runs, measured with perf_counter on a batch of
+    one. The median is reported because the mean of a short timing loop on
+    a shared CPU is dominated by scheduling outliers; the interquartile
+    range is returned alongside it as a spread. The returned value covers
+    the encoder forward pass only and excludes image loading,
+    preprocessing and the downstream SVM.
     """
     param_count = sum(p.numel() for p in model.parameters()) / 1e6
-    return param_count
+    dummy = torch.randn(input_size).to(device)
+    model.eval()
+    try:
+        with torch.no_grad():
+            for _ in range(TIMING_WARMUP): _ = model(dummy)
+            times = []
+            for _ in range(TIMING_ITERS):
+                t0 = time.perf_counter()
+                _ = model(dummy)
+                times.append((time.perf_counter() - t0) * 1000.0)
+        ms_per_image = float(np.median(times))
+        ms_iqr = float(np.percentile(times, 75) - np.percentile(times, 25))
+    except Exception as e:
+        print(f"Warning: Speed test failed ({e}). Returning 0.")
+        ms_per_image, ms_iqr = 0.0, 0.0
+
+    return param_count, ms_per_image, ms_iqr
 
 @torch.inference_mode()
 def vit_forward_embeddings(model, x: torch.Tensor, pooling: str) -> torch.Tensor:
@@ -361,13 +393,18 @@ def main():
     # --- Efficiency Measurement ---
     print("Measuring efficiency metrics...", flush=True)
     dummy_shape = (1, 3, used_size, used_size)
-    params_m_check = measure_efficiency(model, device, dummy_shape)
+    _, inference_ms, inference_iqr = measure_efficiency(model, device, dummy_shape)
     print(f"  > Params: {params_m:.2f} M (counted at full precision)")
+    print(f"  > Inference ({precision}): {inference_ms:.2f} ms/img (median of {TIMING_ITERS}, IQR {inference_iqr:.2f})")
 
     with open(efficiency_path, "w") as f:
         json.dump({"params_M": params_m,
+                   "inference_ms": inference_ms,
+                   "inference_ms_iqr": inference_iqr,
+                   "timing_warmup": TIMING_WARMUP,
+                   "timing_iters": TIMING_ITERS,
                    "precision": precision,
-                   "weights": str(ckpt_used)}, f)
+                   "weights": str(ckpt_used)}, f, indent=2)
 
     # Infer feature dim D
     try:
