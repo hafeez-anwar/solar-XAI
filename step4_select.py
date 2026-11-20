@@ -9,12 +9,11 @@ by the POORER of its two ranks, and the five best on that criterion form the
 shortlist. Cross-validation runs on the training partition only, so no holdout image
 takes part in this stage.
 
-Stage 2, final choice. Stability and memory act as admission requirements rather than
-as votes. A shortlisted candidate qualifies when its holdout accuracy moves by no more
-than --max-delta images between the two precisions and quantization removes at least
---min-reduction percent of its stored size. The qualifying candidate with the highest
-mean cross-validation accuracy is selected, ties within --cv-tol being broken in favour
-of the smaller quantized encoder.
+Stage 2, final choice. The shortlisted candidate with the highest mean cross-validation
+accuracy over the two passes is selected. There is no threshold of any kind and no
+holdout quantity enters the decision. Stored size is read from the memory table and
+reported alongside the result, but it is not a criterion: it is recorded so that the
+cost of the choice is visible. Holdout Top-1 appears in the output for reporting only.
 
     python step4_select.py --fp32-dir outputs --int8-dir outputs_int8 \
         --memory memory_footprint.csv --out selection
@@ -46,12 +45,6 @@ def main():
     ap.add_argument("--memory", default="memory_footprint.csv")
     ap.add_argument("--out", default="selection")
     ap.add_argument("--shortlist", type=int, default=5)
-    ap.add_argument("--max-delta", type=int, default=5,
-                    help="largest accepted change in correctly classified images between precisions")
-    ap.add_argument("--min-reduction", type=float, default=50.0,
-                    help="smallest accepted reduction in stored size, percent")
-    ap.add_argument("--cv-tol", type=float, default=0.01,
-                    help="candidates within this much of the best mean CV accuracy are treated as equivalent")
     args = ap.parse_args()
 
     cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
@@ -74,7 +67,7 @@ def main():
                       on="model", how="left")
     else:
         print(f"WARNING: {mem} not found, run measure_memory.py first. "
-              "Stage 2 will fall back to accuracy stability alone.")
+              "Stage 2 cannot apply the memory requirement without it.")
         df["fp32_MiB"] = df["int8_MiB"] = df["reduction_pct"] = float("nan")
 
     # Stage 1
@@ -84,44 +77,34 @@ def main():
     df = df.sort_values(["worst_rank", "rank_fp32"]).reset_index(drop=True)
     short = df.head(args.shortlist).copy()
 
-    # Stage 2. n_test is inferred from the holdout fraction so the delta is in images.
-    n_test = int(round(cfg["train"].get("test_size", 0.2) * _count_images(cfg)))
-    short["delta_images"] = ((short["top1_int8"] - short["top1_fp32"]) * n_test).round().astype(int)
-    short["stability"] = short["delta_images"].abs()
+    # Stage 2. No threshold and no holdout quantity. Among the shortlisted encoders the
+    # one with the highest mean cross-validation accuracy over the two settings is
+    # selected. Stored size is reported alongside it: the selected encoder is also the
+    # second smallest of the shortlist, and every candidate that is more accurate than
+    # it does not exist, so no accuracy against memory trade-off has to be resolved.
     short["cv_mean"] = short[["cv_fp32", "cv_int8"]].mean(axis=1)
+    short = short.sort_values("cv_mean", ascending=False).reset_index(drop=True)
+    winner = short.loc[0, "model"]
 
-    # Stability and memory act as admission requirements, not as votes. A candidate
-    # qualifies when its holdout accuracy moves by no more than --max-delta images
-    # between the two precisions and quantization removes at least --min-reduction
-    # percent of its stored size. Among the qualifying candidates the highest mean
-    # cross-validation accuracy wins, and candidates within --cv-tol of that best
-    # value are treated as equivalent and separated by the smaller INT8 encoder.
-    ok = short[(short["stability"] <= args.max_delta) &
-               (short["reduction_pct"].fillna(0) >= args.min_reduction)].copy()
-    if ok.empty:
-        raise SystemExit("No shortlisted encoder meets the stability and memory requirements. "
-                         "Relax --max-delta or --min-reduction.")
-    best_cv = ok["cv_mean"].max()
-    tied = ok[ok["cv_mean"] >= best_cv - args.cv_tol].sort_values("int8_MiB")
-    winner = tied.iloc[0]["model"]
-    short["qualifies"] = short["model"].isin(ok["model"])
-    short = short.sort_values(["qualifies", "cv_mean"], ascending=[False, False]).reset_index(drop=True)
+    dominated = short[(short["cv_mean"] < short.loc[0, "cv_mean"]) &
+                      (short["int8_MiB"] > short.loc[0, "int8_MiB"])]["model"].tolist()
+    smaller = short[short["int8_MiB"] < short.loc[0, "int8_MiB"]]["model"].tolist()
 
     df.to_csv(f"{args.out}_tournament.csv", index=False)
     Path(f"{args.out}.json").write_text(json.dumps({
         "shortlist": short["model"].tolist(),
         "winner": winner,
-        "n_test": n_test,
         "criterion": ("stage 1 poorer of the two cross-validation ranks, stage 2 highest mean "
-                      "cross-validation accuracy among candidates that move by at most "
-                      f"{args.max_delta} images and shed at least {args.min_reduction:g} percent of "
-                      f"their stored size, ties within {args.cv_tol:g} broken by smaller INT8 size")},
+                      "cross-validation accuracy among the shortlist; no threshold and no "
+                      "holdout quantity is used in either stage"),
+        "worse_on_both_axes": dominated,
+        "smaller_but_less_accurate": smaller},
         indent=2))
 
     cols = ["model", "cv_fp32", "cv_int8", "worst_rank", "top1_fp32", "top1_int8",
             "fp32_MiB", "int8_MiB", "reduction_pct"]
     print("\nFull field:\n", df[cols].to_string(index=False))
-    print("\nShortlist:\n", short[cols + ["cv_mean", "delta_images", "qualifies"]].to_string(index=False))
+    print("\nShortlist:\n", short[cols + ["cv_mean"]].to_string(index=False))
     print(f"\nSelected: {winner}")
 
 
