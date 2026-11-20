@@ -11,7 +11,7 @@ Transformer Framework for Image-based Photovoltaic Soiling Detection*.
 
 | Stage | Script | Output |
 |---|---|---|
-| Encode images with a candidate backbone; measure parameter count and memory footprint | `step1_encode.py` | `<model>/encodings/features.npy`, `<model>/efficiency.json` |
+| Encode images with a candidate backbone; measure parameter count and inference latency | `step1_encode.py` | `<model>/encodings/features.npy`, `<model>/efficiency.json` |
 | Train and evaluate the linear SVM, write plots and error analysis | `step2_svm_train.py` | `<model>/models/<model>_metrics.json`, `<model>/plots/`, `<model>/error_analysis/` |
 | Explain the chosen model with LIME, RISE, SHAP and attention rollout | `step3_explain.py` | `explanations/<model>/<method>/metrics_<method>.csv` |
 | Run every candidate and aggregate the leaderboard | `main.py` | `model_leaderboard.xlsx` |
@@ -71,7 +71,8 @@ Place `images_GT/` at the project root with exactly two subfolders, `images/` an
 ├── main.py
 ├── step1_encode.py
 ├── step2_svm_train.py
-└── step3_explain.py
+├── step3_explain.py
+└── step4_select.py
 ```
 
 ## Configuration
@@ -136,13 +137,6 @@ python main.py --config config.yaml --force-explain   # re-run the explainabilit
 Adding a new model to `models.candidates` therefore costs only that model's encoding and
 training, plus the explainability stage if the addition takes the top of the leaderboard.
 
-Before committing to a long run, check that new candidates build, survive quantization and
-produce a sensible feature dimension:
-
-```bash
-python check_candidates.py --config config.yaml
-```
-
 ## Evaluation protocol
 
 `step2_svm_train.py` creates the stratified holdout partition first, then runs five fold stratified
@@ -156,8 +150,7 @@ in `error_analysis/error_report.csv` and in the confidence histogram are Platt s
 
 ## Selecting the encoder
 
-Selection uses both passes and runs after `main.py` has completed at FP32 and at INT8 and
-after `measure_memory.py` has written `memory_footprint.csv`.
+Selection uses both passes and runs after `main.py` has completed at FP32 and at INT8.
 
 ```bash
 python step4_select.py --config config.yaml --fp32-dir outputs --int8-dir outputs_int8
@@ -167,34 +160,25 @@ Stage 1 ranks every candidate by cross-validation accuracy in each pass and keep
 with the best poorer rank. Cross-validation runs on the training partition only, so the
 holdout images take no part in forming the shortlist.
 
-Stage 2 treats stability and memory as admission requirements rather than as scores. A
-shortlisted candidate qualifies when its holdout accuracy moves by at most `--max-delta`
-images between the two precisions and when quantization removes at least `--min-reduction`
-percent of its stored size. The qualifying candidate with the highest mean cross-validation
-accuracy is selected, ties within `--cv-tol` going to the smaller quantized encoder. The
-defaults are 5 images, 50 percent and 0.01, and they select `tiny_vit_11m_224`. Results go to
-`selection.json` and `selection_tournament.csv`.
-
-## Memory footprint
-
-`measure_memory.py` records the serialised size of each candidate encoder before and after
-dynamic INT8 quantization. It is independent of the main runner and needs only the timm cache.
-
-```bash
-python measure_memory.py --config config.yaml --out memory_footprint.csv
-```
-
-The resulting `memory_footprint.csv` holds `params_M`, `fp32_MiB`, `int8_MiB`, the absolute and
-percentage reduction and the ratio, one row per candidate. Because the procedure converts the
-weights of linear layers only, the reduction is not a uniform factor of four. It reaches about
-70 percent for the encoders built from linear projections and zero for those whose projections
-are convolutions.
+Stage 2 uses no threshold and no holdout quantity. The shortlisted encoder with the highest
+mean cross-validation accuracy over the two settings is selected, which is `tiny_vit_11m_224`.
+Stored size is reported beside it rather than used as a rule: that encoder is also the second
+smallest of the shortlist, and three of the other four are both less accurate and larger, so
+no accuracy against memory trade-off has to be resolved. `selection.json` lists those three
+under `worse_on_both_axes` and the one smaller but less accurate candidate under
+`smaller_but_less_accurate`. Holdout Top-1 appears in the output for reporting only, so no
+holdout image influences model selection at any stage.
 
 ## Outputs
 
-* `efficiency.json` records `params_M` counted on the full precision graph, `precision`
-  (`fp32` or `int8`), and the resolved `weights` path.
-  For per-model stored encoder sizes in MiB run `measure_memory.py` (see **Memory footprint** above).
+* `efficiency.json` records `params_M` counted on the full precision graph, `inference_ms` and
+  `inference_ms_iqr` for the encoder forward pass, the `timing_warmup` and `timing_iters` used,
+  `precision` (`fp32` or `int8`), and the resolved `weights` path. The timing protocol is fixed by
+  the `TIMING_WARMUP` and `TIMING_ITERS` constants at the top of `step1_encode.py`: the encoder
+  forward pass alone at a batch size of one, ten warm-up passes, then the median of one hundred
+  timed repetitions with the interquartile range, on four CPU threads. Image loading, resizing,
+  normalization and the SVM are excluded. These times are not used for any claim in the paper,
+  which reports efficiency as the stored size of the encoder.
 * `<model>_metrics.json` records holdout accuracy, macro F1, macro precision and recall, AUC, the
   cross validation mean and standard deviation, and the t-SNE silhouette and KL divergence.
 * `error_analysis/error_report.csv` lists every misclassified holdout image with its true label,
